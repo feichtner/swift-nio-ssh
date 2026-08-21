@@ -361,6 +361,10 @@ extension NIOSSHCertifiedPublicKey {
             return Self.p521KeyPrefix
         case .certified:
             preconditionFailure("base key cannot be certified")
+        case .custom:
+            // FeTerm patch: the certificate parser can never produce a custom
+            // base key, so this is unreachable.
+            preconditionFailure("custom keys cannot be certified")
         }
     }
 

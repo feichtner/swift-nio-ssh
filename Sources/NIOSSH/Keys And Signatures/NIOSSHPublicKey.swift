@@ -99,7 +99,9 @@ extension NIOSSHPublicKey {
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _):
+            (.ecdsaP521, _),
+            (.custom, _):
+            // FeTerm patch: custom keys cannot verify — the server does that.
             return false
         }
     }
@@ -121,7 +123,9 @@ extension NIOSSHPublicKey {
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _):
+            (.ecdsaP521, _),
+            (.custom, _):
+            // FeTerm patch: custom keys cannot verify — the server does that.
             return false
         }
     }
@@ -143,7 +147,9 @@ extension NIOSSHPublicKey {
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
-            (.ecdsaP521, _):
+            (.ecdsaP521, _),
+            (.custom, _):
+            // FeTerm patch: custom keys cannot verify — the server does that.
             return false
         }
     }
@@ -158,6 +164,10 @@ extension NIOSSHPublicKey {
         case ecdsaP384(P384.Signing.PublicKey)
         case ecdsaP521(P521.Signing.PublicKey)
         case certified(NIOSSHCertifiedPublicKey)  // This case recursively contains `NIOSSHPublicKey`.
+
+        // FeTerm patch: a pre-encoded public-key blob (sk-* and friends),
+        // written verbatim. Client user-auth only; cannot verify signatures.
+        case custom(algorithmName: String, blob: ByteBuffer)
     }
 
     /// The prefix of an Ed25519 public key.
@@ -184,6 +194,8 @@ extension NIOSSHPublicKey {
             return Self.ecdsaP521PublicKeyPrefix
         case .certified(let base):
             return base.keyPrefix
+        case .custom(let algorithmName, _):
+            return algorithmName.utf8
         }
     }
 
@@ -209,11 +221,14 @@ extension NIOSSHPublicKey.BackingKey: Equatable {
             return lhs.rawRepresentation == rhs.rawRepresentation
         case (.certified(let lhs), .certified(let rhs)):
             return lhs == rhs
+        case (.custom(let lhsName, let lhsBlob), .custom(let rhsName, let rhsBlob)):
+            return lhsName == rhsName && lhsBlob == rhsBlob
         case (.ed25519, _),
             (.ecdsaP256, _),
             (.ecdsaP384, _),
             (.ecdsaP521, _),
-            (.certified, _):
+            (.certified, _),
+            (.custom, _):
             return false
         }
     }
@@ -237,6 +252,10 @@ extension NIOSSHPublicKey.BackingKey: Hashable {
         case .certified(let pkey):
             hasher.combine(5)
             hasher.combine(pkey)
+        case .custom(let algorithmName, let blob):
+            hasher.combine(6)
+            hasher.combine(algorithmName)
+            hasher.combine(blob)
         }
     }
 }
@@ -262,6 +281,9 @@ extension ByteBuffer {
             writtenBytes += self.writeECDSAP521PublicKey(baseKey: key)
         case .certified(let key):
             return self.writeCertifiedKey(key)
+        case .custom(_, let blob):
+            // The blob is complete (string(algorithm-name) included): verbatim.
+            return self.writeBytes(blob.readableBytesView)
         }
 
         return writtenBytes
@@ -283,6 +305,10 @@ extension ByteBuffer {
             return self.writeECDSAP521PublicKey(baseKey: key)
         case .certified:
             preconditionFailure("Certified keys are the only callers of this method, and cannot contain themselves")
+        case .custom:
+            // Only the certified-key writer calls this, and custom keys
+            // cannot appear inside certificates.
+            preconditionFailure("Custom keys cannot be written without their prefix")
         }
     }
 

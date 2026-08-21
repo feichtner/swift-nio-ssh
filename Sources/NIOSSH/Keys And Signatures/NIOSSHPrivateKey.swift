@@ -58,6 +58,11 @@ public struct NIOSSHPrivateKey: Sendable {
     }
     #endif
 
+    // FeTerm patch: external-signer hook.
+    public init(custom key: any NIOSSHCustomPrivateKey) {
+        self.backingKey = .custom(key)
+    }
+
     // The algorithms that apply to this host key.
     internal var hostKeyAlgorithms: [Substring] {
         switch self.backingKey {
@@ -73,6 +78,8 @@ public struct NIOSSHPrivateKey: Sendable {
         case .secureEnclaveP256:
             return ["ecdsa-sha2-nistp256"]
         #endif
+        case .custom(let key):
+            return [Substring(key.algorithmName)]
         }
     }
 }
@@ -88,6 +95,9 @@ extension NIOSSHPrivateKey {
         #if canImport(Darwin)
         case secureEnclaveP256(SecureEnclave.P256.Signing.PrivateKey)
         #endif
+
+        // FeTerm patch: a key that signs externally (security key, SecKey, PIV).
+        case custom(any NIOSSHCustomPrivateKey)
     }
 }
 
@@ -122,6 +132,12 @@ extension NIOSSHPrivateKey {
             }
             return NIOSSHSignature(backingSignature: .ecdsaP256(signature))
         #endif
+        case .custom(let key):
+            // Custom keys are client user-auth keys; they never sign kex digests.
+            throw NIOSSHError.protocolViolation(
+                protocolName: "custom key",
+                violation: "\(key.algorithmName) cannot sign key-exchange digests"
+            )
         }
     }
 
@@ -144,6 +160,13 @@ extension NIOSSHPrivateKey {
             let signature = try key.signature(for: payload.bytes.readableBytesView)
             return NIOSSHSignature(backingSignature: .ecdsaP256(signature))
         #endif
+        case .custom(let key):
+            // May block for user interaction (touch / biometrics); see the
+            // protocol's documentation about private event loops.
+            let blob = try key.sshSignature(forPayload: Data(payload.bytes.readableBytesView))
+            var buffer = ByteBufferAllocator().buffer(capacity: blob.count)
+            buffer.writeBytes(blob)
+            return NIOSSHSignature(backingSignature: .custom(buffer))
         }
     }
 }
@@ -164,6 +187,11 @@ extension NIOSSHPrivateKey {
         case .secureEnclaveP256(let privateKey):
             return NIOSSHPublicKey(backingKey: .ecdsaP256(privateKey.publicKey))
         #endif
+        case .custom(let key):
+            let blob = key.publicKeyBlob
+            var buffer = ByteBufferAllocator().buffer(capacity: blob.count)
+            buffer.writeBytes(blob)
+            return NIOSSHPublicKey(backingKey: .custom(algorithmName: key.algorithmName, blob: buffer))
         }
     }
 }
