@@ -35,7 +35,11 @@ extension SSHConnectionStateMachine {
         /// The backing state machine.
         var userAuthStateMachine: UserAuthenticationStateMachine
 
+        /// Carried forward from the key exchange, which this state drops.
+        var negotiatedAlgorithms: NIOSSHNegotiatedAlgorithms?
+
         init(sentNewKeysState state: SentNewKeysState) {
+            self.negotiatedAlgorithms = state.keyExchangeStateMachine.negotiatedAlgorithms
             self.role = state.role
             self.parser = state.parser
             self.serializer = state.serializer
@@ -46,6 +50,7 @@ extension SSHConnectionStateMachine {
         }
 
         init(receivedNewKeysState state: ReceivedNewKeysState) {
+            self.negotiatedAlgorithms = state.keyExchangeStateMachine.negotiatedAlgorithms
             self.role = state.role
             self.parser = state.parser
             self.serializer = state.serializer

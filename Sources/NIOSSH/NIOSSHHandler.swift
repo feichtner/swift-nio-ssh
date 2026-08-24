@@ -261,6 +261,20 @@ extension NIOSSHHandler: ChannelDuplexHandler {
     }
 }
 
+// MARK: Negotiated algorithms
+
+extension NIOSSHHandler {
+    /// The algorithms the most recent completed key exchange negotiated —
+    /// what is actually protecting this connection, as opposed to what this
+    /// build could offer. `nil` until the first key exchange settles.
+    ///
+    /// This function is **not** thread-safe: it may only be read from on
+    /// the channel's event loop.
+    public var negotiatedAlgorithms: NIOSSHNegotiatedAlgorithms? {
+        self.stateMachine.negotiatedAlgorithms
+    }
+}
+
 // MARK: Create a child channel
 
 extension NIOSSHHandler {

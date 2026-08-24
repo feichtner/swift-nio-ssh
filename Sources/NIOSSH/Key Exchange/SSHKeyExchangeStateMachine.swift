@@ -93,6 +93,12 @@ struct SSHKeyExchangeStateMachine {
     private var protectionSchemes: [NIOSSHTransportProtection.Type]
     private var previousSessionIdentifier: ByteBuffer?
 
+    /// What negotiation settled on, captured when it happens: the
+    /// `.complete` state does not carry the NegotiationResult, and the
+    /// connection state machine needs these names after the exchange is
+    /// long finished.
+    private(set) var negotiatedAlgorithms: NIOSSHNegotiatedAlgorithms?
+
     init(
         allocator: ByteBufferAllocator,
         loop: EventLoop,
@@ -152,6 +158,7 @@ struct SSHKeyExchangeStateMachine {
 
                 // verify algorithms
                 let negotiated = try self.negotiatedAlgorithms(message)
+                self.negotiatedAlgorithms = NIOSSHNegotiatedAlgorithms(negotiated)
                 let exchanger = try self.exchangerForAlgorithm(negotiated.negotiatedKeyExchangeAlgorithm)
 
                 // Ok, we need to send the key exchange message.
@@ -165,6 +172,7 @@ struct SSHKeyExchangeStateMachine {
                 self.addKeyExchangeInitMessagesToExchangeBytes(clientsMessage: message, serversMessage: ourMessage)
 
                 let negotiated = try self.negotiatedAlgorithms(message)
+                self.negotiatedAlgorithms = NIOSSHNegotiatedAlgorithms(negotiated)
                 let exchanger = try self.exchangerForAlgorithm(negotiated.negotiatedKeyExchangeAlgorithm)
 
                 // Ok, we're waiting for them to go. They might be sending a wrong guess, which we want to ignore.
@@ -188,6 +196,7 @@ struct SSHKeyExchangeStateMachine {
             }
 
             let negotiated = try self.negotiatedAlgorithms(message)
+            self.negotiatedAlgorithms = NIOSSHNegotiatedAlgorithms(negotiated)
             let exchanger = try self.exchangerForAlgorithm(negotiated.negotiatedKeyExchangeAlgorithm)
 
             let result: SSHMultiMessage
@@ -607,6 +616,16 @@ extension SSHKeyExchangeStateMachine {
     static let supportedServerHostKeyAlgorithms: [Substring] = [
         "ssh-ed25519", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp521",
     ]
+}
+
+extension NIOSSHNegotiatedAlgorithms {
+    fileprivate init(_ result: SSHKeyExchangeStateMachine.NegotiationResult) {
+        self.init(
+            keyExchange: String(result.negotiatedKeyExchangeAlgorithm),
+            hostKey: String(result.negotiatedHostKeyAlgorithm),
+            cipher: result.negotiatedProtection.cipherName
+        )
+    }
 }
 
 extension SSHKeyExchangeStateMachine {

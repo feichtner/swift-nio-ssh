@@ -1305,3 +1305,36 @@ extension SSHConnectionStateMachine {
         }
     }
 }
+
+extension SSHConnectionStateMachine {
+    /// The algorithms the most recent completed key exchange negotiated,
+    /// or nil before the first negotiation settles. During a rekey this
+    /// reads the in-flight exchange, which repopulates as soon as the new
+    /// negotiation completes.
+    var negotiatedAlgorithms: NIOSSHNegotiatedAlgorithms? {
+        switch self.state {
+        case .idle, .sentVersion, .receivedDisconnect, .sentDisconnect:
+            return nil
+        case .keyExchange(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .sentNewKeys(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .receivedNewKeys(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .userAuthentication(let state):
+            return state.negotiatedAlgorithms
+        case .active(let state):
+            return state.negotiatedAlgorithms
+        case .receivedKexInitWhenActive(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .sentKexInitWhenActive(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .rekeying(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .rekeyingSentNewKeysState(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        case .rekeyingReceivedNewKeysState(let state):
+            return state.keyExchangeStateMachine.negotiatedAlgorithms
+        }
+    }
+}

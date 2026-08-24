@@ -250,3 +250,25 @@ extension SSHConnectionRole {
         )
     }
 }
+
+final class NegotiatedAlgorithmsTests: XCTestCase {
+    /// The handler must report what the handshake really negotiated, and
+    /// the value must survive past key exchange into the active connection
+    /// (the states that drop the key exchange machine carry it forward).
+    func testHandlerReportsNegotiatedAlgorithms() throws {
+        let channel = BackToBackEmbeddedChannel()
+        defer { try? channel.finish() }
+        XCTAssertNoThrow(try channel.configureWithHarness(TestHarness()))
+        XCTAssertNoThrow(try channel.activate())
+        XCTAssertNoThrow(try channel.interactInMemory())
+
+        for handler in [channel.clientSSHHandler, channel.serverSSHHandler] {
+            let negotiated = try XCTUnwrap(try XCTUnwrap(handler).negotiatedAlgorithms)
+            // Both in-memory peers are this build, so the shared first
+            // preference — the post-quantum exchange — must have won.
+            XCTAssertEqual(negotiated.keyExchange, "sntrup761x25519-sha512")
+            XCTAssertEqual(negotiated.hostKey, "ssh-ed25519")
+            XCTAssertFalse(negotiated.cipher.isEmpty)
+        }
+    }
+}

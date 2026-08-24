@@ -31,7 +31,11 @@ extension SSHConnectionStateMachine {
 
         internal var sessionIdentifier: ByteBuffer
 
+        /// What the most recently completed key exchange negotiated.
+        internal var negotiatedAlgorithms: NIOSSHNegotiatedAlgorithms?
+
         init(_ previous: UserAuthenticationState) {
+            self.negotiatedAlgorithms = previous.negotiatedAlgorithms
             self.role = previous.role
             self.serializer = previous.serializer
             self.parser = previous.parser
@@ -41,6 +45,7 @@ extension SSHConnectionStateMachine {
         }
 
         init(_ previous: RekeyingReceivedNewKeysState) {
+            self.negotiatedAlgorithms = previous.keyExchangeStateMachine.negotiatedAlgorithms
             self.role = previous.role
             self.serializer = previous.serializer
             self.parser = previous.parser
@@ -50,6 +55,7 @@ extension SSHConnectionStateMachine {
         }
 
         init(_ previous: RekeyingSentNewKeysState) {
+            self.negotiatedAlgorithms = previous.keyExchangeStateMachine.negotiatedAlgorithms
             self.role = previous.role
             self.serializer = previous.serializer
             self.parser = previous.parser
