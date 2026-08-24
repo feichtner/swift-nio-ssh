@@ -588,8 +588,11 @@ struct SSHKeyExchangeStateMachine {
 }
 
 extension SSHKeyExchangeStateMachine {
-    // For now this is a static list.
+    // For now this is a static list. The hybrid post-quantum exchange leads:
+    // list order is client preference order, and any server that offers
+    // sntrup761x25519 should get it rather than classical ECDH.
     static let supportedKeyExchangeImplementations: [EllipticCurveKeyExchangeProtocol.Type] = [
+        SNTRUP761X25519KeyExchange.self,
         EllipticCurveKeyExchange<P384.KeyAgreement.PrivateKey>.self,
         EllipticCurveKeyExchange<P256.KeyAgreement.PrivateKey>.self,
         EllipticCurveKeyExchange<P521.KeyAgreement.PrivateKey>.self,
