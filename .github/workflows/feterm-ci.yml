@@ -1,0 +1,37 @@
+# FeTerm patch-branch CI. Upstream's workflows target main and do not run
+# for feterm-patches, so until now this branch's 361-test suite ran only on
+# the maintainer's machine — the consuming app's CI compiles these sources
+# but never executes this package's own tests. Public repo, hosted runner,
+# no self-hosted exposure.
+name: feterm-ci
+
+on:
+  push:
+    branches: [feterm-patches]
+  pull_request:
+    branches: [feterm-patches]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: feterm-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify vendored sntrup761.c is byte-identical to upstream
+        run: |
+          apt-get update -qq && apt-get install -y -qq curl >/dev/null
+          curl -sf https://raw.githubusercontent.com/openssh/openssh-portable/master/sntrup761.c \
+            -o /tmp/sntrup761-upstream.c
+          if ! diff -q /tmp/sntrup761-upstream.c Sources/CNIOSSHSNTRUP761/sntrup761.c; then
+            echo "::warning::vendored sntrup761.c differs from current openssh-portable master —"
+            echo "::warning::either upstream moved (refresh + re-test) or the vendored copy was edited (forbidden)."
+          fi
+      - name: Test
+        run: swift test

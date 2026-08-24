@@ -32,6 +32,9 @@ void cnio_sntrup761_randombytes(void *buf, size_t buf_len);
 
 #define crypto_hash_sha512_BYTES 64U
 
+/* Correct for inputs below 2^61 bytes (the length field is bits in a
+ * 64-bit word). sntrup761's inputs top out around 1.2 KB; treat larger
+ * inputs as out of contract rather than extending the length encoding. */
 int crypto_hash_sha512(unsigned char *out, const unsigned char *in,
     unsigned long long inlen);
 
