@@ -85,6 +85,42 @@ no new parse surface. **Sound.**
 | SHA-512 shim silently wrong above 2^61 bytes | Low | **Fixed** — contract documented at the declaration; unreachable from sntrup761. |
 | ML-KEM keygen `try!` aborts on entropy failure | Info | By design — identical to the C shim's `abort()`; documented at the call. |
 
+## Modern language features audit (2026-08-24 addendum)
+
+What the security-relevant Swift feature set looks like here, verified
+against the actual compile flags rather than the manifest:
+
+**In effect:**
+- **Swift 6 language mode** on the NIOSSH target (checked in the build
+  invocation: `-swift-version 6`) — compile-time data-race safety covers
+  all four patches; `Sendable` is enforced, not advisory.
+- **MemberImportVisibility** upcoming feature (upstream's cross-repo
+  settings block) — no API reachable through transitive imports.
+- All Swift-side cryptography via swift-crypto; the only non-library
+  primitive is the vendored, drift-checked sntrup761.
+
+**Evaluated, not adopted — with reasons:**
+- **Noncopyable single-use secrets** (`~Copyable`, SE-0390/0427): the
+  natural fit for the KEM secret's single-use invariant, but a
+  noncopyable stored field makes the containing key-exchange struct
+  noncopyable, and upstream's connection state machine copies exchanger
+  values between states — adopting it means forking the state machine,
+  which loses diffability for a guarantee the code already enforces
+  dynamically (secret consumed and nil'ed; second use throws; pinned by
+  tests). Worth revisiting if upstream ever adopts noncopyable state.
+- **CoW audit in lieu of it**: verified that the current `[UInt8]`
+  secret has exactly one buffer end to end — state-machine copies share
+  it (no intervening writes), and zeroization happens on the sole owner
+  after decapsulation. The dynamic guarantee is real, not aspirational.
+- **Strict memory safety** (`-strict-memory-safety`, SE-0458): would
+  flag every `withUnsafeBytes` in upstream code — hundreds of warnings
+  on a fork meant to stay diffable. Right tool for upstream, not for a
+  patch branch.
+- **Span/InlineArray** (SE-0447/0453): the C boundary passes exact-size
+  whole buffers with no slice arithmetic, which is the failure mode
+  those types remove; adopting them here would churn interop code
+  without closing a reachable bug class.
+
 ## Standing recommendations
 
 1. Track upstream: re-run `git rev-list --count` both ways before each
