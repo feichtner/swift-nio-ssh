@@ -17,49 +17,166 @@ import Crypto
 import NIOCore
 import NIOFoundationCompat
 
-/// The `sntrup761x25519-sha512` hybrid post-quantum key exchange
-/// (draft-josefsson-ntruprime-ssh; OpenSSH's default since 9.0 as
-/// `sntrup761x25519-sha512@openssh.com`).
+#if canImport(FoundationEssentials)
+import FoundationEssentials
+#else
+import Foundation
+#endif
+
+/// The hybrid post-quantum key exchanges: `mlkem768x25519-sha256`
+/// (draft-kampanakis-curdle-ssh-pq-ke; OpenSSH's default since 9.9) and
+/// `sntrup761x25519-sha512` (draft-josefsson-ntruprime-ssh; OpenSSH's
+/// default 9.0–9.8, offered since 8.5).
 ///
-/// A hybrid KEM: the client sends a Streamlined NTRU Prime 761 public key
-/// and an X25519 public key concatenated; the server replies with an
-/// sntrup761 ciphertext and its own X25519 public key concatenated. The
-/// shared secret is `K = SHA-512(sntrup761_key ‖ x25519_secret)`, so a
-/// break of either primitive alone recovers nothing. The session stays
-/// secure against an adversary recording traffic today to decrypt with a
-/// quantum computer later — as long as sntrup761 holds — while X25519
-/// guards against sntrup761 turning out to be weaker than believed.
+/// Both follow the same shape, differing only in the KEM and the hash:
+/// the client sends its KEM public key and an X25519 public key
+/// concatenated; the server replies with a KEM ciphertext and its own
+/// X25519 public key concatenated; the shared secret is
+/// `K = HASH(kem_key ‖ x25519_secret)`, so a break of either primitive
+/// alone recovers nothing. The session stays secure against an adversary
+/// recording traffic today to decrypt with a quantum computer later — as
+/// long as the lattice KEM holds — while X25519 guards against the KEM
+/// turning out to be weaker than believed.
 ///
 /// This deliberately does NOT conform to `ECDHCompatiblePrivateKey`: a KEM
 /// is not a Diffie-Hellman (the server encapsulates rather than agreeing),
-/// and the draft requires K to be hashed as an SSH `string` where classical
-/// ECDH hashes it as an `mpint`. It implements the type-erased
+/// and both drafts require K to be hashed as an SSH `string` where
+/// classical ECDH hashes it as an `mpint`. It implements the type-erased
 /// `EllipticCurveKeyExchangeProtocol` directly, whose message shapes carry
 /// opaque byte blobs and fit a KEM unchanged.
-struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
-    private var previousSessionIdentifier: ByteBuffer?
-    private var ourRole: SSHConnectionRole
+protocol HybridKEMProvider {
+    associatedtype Hasher: HashFunction
+    /// A client's decapsulation capability, kept opaque: raw bytes for the
+    /// C sntrup761, a CryptoKit object for ML-KEM.
+    associatedtype SecretKey
 
-    /// The client's sntrup761 keypair. Only the client has one; the server
-    /// encapsulates against the client's public key.
-    private var sntrupPublicKey: [UInt8]
-    private var sntrupSecretKey: [UInt8]
-    private var x25519Key: Curve25519.KeyAgreement.PrivateKey
+    static var publicKeyBytes: Int { get }
+    static var ciphertextBytes: Int { get }
+    static var keyExchangeAlgorithmNames: [Substring] { get }
 
-    static let sntrupPublicKeyBytes = Int(crypto_kem_sntrup761_PUBLICKEYBYTES)
-    static let sntrupSecretKeyBytes = Int(crypto_kem_sntrup761_SECRETKEYBYTES)
-    static let sntrupCiphertextBytes = Int(crypto_kem_sntrup761_CIPHERTEXTBYTES)
-    static let sntrupSharedKeyBytes = Int(crypto_kem_sntrup761_BYTES)
-    static let x25519PublicKeyBytes = 32
+    static func keypair() -> (publicKey: [UInt8], secretKey: SecretKey)
+    /// Server side: encapsulate a fresh shared key to the client's public key.
+    static func encapsulate(to publicKey: [UInt8]) throws -> (ciphertext: [UInt8], key: [UInt8])
+    /// Client side: recover the shared key from the server's ciphertext.
+    static func decapsulate(_ ciphertext: [UInt8], with secretKey: inout SecretKey) throws -> [UInt8]
+}
 
-    /// Client public value `Q_C`: sntrup761 public key ‖ X25519 public key.
-    static let clientPublicValueBytes = sntrupPublicKeyBytes + x25519PublicKeyBytes
-    /// Server public value `Q_S`: sntrup761 ciphertext ‖ X25519 public key.
-    static let serverPublicValueBytes = sntrupCiphertextBytes + x25519PublicKeyBytes
+enum SNTRUP761: HybridKEMProvider {
+    typealias Hasher = SHA512
+    typealias SecretKey = [UInt8]
+
+    static let publicKeyBytes = Int(crypto_kem_sntrup761_PUBLICKEYBYTES)
+    static let ciphertextBytes = Int(crypto_kem_sntrup761_CIPHERTEXTBYTES)
+    static let sharedKeyBytes = Int(crypto_kem_sntrup761_BYTES)
+    static let secretKeyBytes = Int(crypto_kem_sntrup761_SECRETKEYBYTES)
 
     static let keyExchangeAlgorithmNames: [Substring] = [
         "sntrup761x25519-sha512", "sntrup761x25519-sha512@openssh.com",
     ]
+
+    static func keypair() -> (publicKey: [UInt8], secretKey: [UInt8]) {
+        var publicKey = [UInt8](repeating: 0, count: Self.publicKeyBytes)
+        var secretKey = [UInt8](repeating: 0, count: Self.secretKeyBytes)
+        publicKey.withUnsafeMutableBufferPointer { pk in
+            secretKey.withUnsafeMutableBufferPointer { sk in
+                _ = crypto_kem_sntrup761_keypair(pk.baseAddress, sk.baseAddress)
+            }
+        }
+        return (publicKey, secretKey)
+    }
+
+    static func encapsulate(to publicKey: [UInt8]) throws -> (ciphertext: [UInt8], key: [UInt8]) {
+        var ciphertext = [UInt8](repeating: 0, count: Self.ciphertextBytes)
+        var key = [UInt8](repeating: 0, count: Self.sharedKeyBytes)
+        ciphertext.withUnsafeMutableBufferPointer { ct in
+            key.withUnsafeMutableBufferPointer { k in
+                publicKey.withUnsafeBufferPointer { pk in
+                    _ = crypto_kem_sntrup761_enc(ct.baseAddress, k.baseAddress, pk.baseAddress)
+                }
+            }
+        }
+        return (ciphertext, key)
+    }
+
+    /// sntrup761 is an implicit-rejection KEM: a corrupted ciphertext does
+    /// not error, it yields a *different* key, and the handshake then dies
+    /// verifying the server's exchange-hash signature. That is the failure
+    /// mode the design intends.
+    static func decapsulate(_ ciphertext: [UInt8], with secretKey: inout [UInt8]) throws -> [UInt8] {
+        var key = [UInt8](repeating: 0, count: Self.sharedKeyBytes)
+        key.withUnsafeMutableBufferPointer { k in
+            ciphertext.withUnsafeBufferPointer { ct in
+                secretKey.withUnsafeBufferPointer { sk in
+                    _ = crypto_kem_sntrup761_dec(k.baseAddress, ct.baseAddress, sk.baseAddress)
+                }
+            }
+        }
+        secretKey.resetBytes(in: secretKey.indices)
+        return key
+    }
+}
+
+/// swift-crypto's ML-KEM comes from CryptoKit on Darwin, which gates it
+/// on the 26.0 OS generation; on Linux it is BoringSSL-backed and always
+/// present (availability checks are no-ops there).
+@available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, macCatalyst 26.0, visionOS 26.0, *)
+enum MLKEM768: HybridKEMProvider {
+    typealias Hasher = SHA256
+    typealias SecretKey = Crypto.MLKEM768.PrivateKey
+
+    static let publicKeyBytes = 1184
+    static let ciphertextBytes = 1088
+
+    static let keyExchangeAlgorithmNames: [Substring] = ["mlkem768x25519-sha256"]
+
+    static func keypair() -> (publicKey: [UInt8], secretKey: Crypto.MLKEM768.PrivateKey) {
+        // Key generation only throws on entropy failure, the same condition
+        // the sntrup761 shim answers with abort(): proceeding without
+        // randomness would be far worse than crashing.
+        let key = try! Crypto.MLKEM768.PrivateKey()
+        return (Array(key.publicKey.rawRepresentation), key)
+    }
+
+    static func encapsulate(to publicKey: [UInt8]) throws -> (ciphertext: [UInt8], key: [UInt8]) {
+        let clientKey = try Crypto.MLKEM768.PublicKey(rawRepresentation: publicKey)
+        let result = try clientKey.encapsulate()
+        let key = result.sharedSecret.withUnsafeBytes { Array($0) }
+        return (Array(result.encapsulated), key)
+    }
+
+    /// ML-KEM is an implicit-rejection KEM like sntrup761: see above.
+    /// Single use is the caller's job — it drops its reference before
+    /// decapsulating.
+    static func decapsulate(
+        _ ciphertext: [UInt8], with secretKey: inout Crypto.MLKEM768.PrivateKey
+    ) throws -> [UInt8] {
+        let shared = try secretKey.decapsulate(Data(ciphertext))
+        return shared.withUnsafeBytes { Array($0) }
+    }
+}
+
+@available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, macCatalyst 26.0, visionOS 26.0, *)
+typealias MLKEM768X25519KeyExchange = HybridKEMX25519KeyExchange<MLKEM768>
+typealias SNTRUP761X25519KeyExchange = HybridKEMX25519KeyExchange<SNTRUP761>
+
+struct HybridKEMX25519KeyExchange<KEM: HybridKEMProvider>: EllipticCurveKeyExchangeProtocol {
+    private var previousSessionIdentifier: ByteBuffer?
+    private var ourRole: SSHConnectionRole
+
+    /// The client's KEM keypair. Only the client has one; the server
+    /// encapsulates against the client's public key.
+    private var kemPublicKey: [UInt8]
+    private var kemSecretKey: KEM.SecretKey?
+    private var x25519Key: Curve25519.KeyAgreement.PrivateKey
+
+    static var x25519PublicKeyBytes: Int { 32 }
+
+    /// Client public value `Q_C`: KEM public key ‖ X25519 public key.
+    static var clientPublicValueBytes: Int { KEM.publicKeyBytes + x25519PublicKeyBytes }
+    /// Server public value `Q_S`: KEM ciphertext ‖ X25519 public key.
+    static var serverPublicValueBytes: Int { KEM.ciphertextBytes + x25519PublicKeyBytes }
+
+    static var keyExchangeAlgorithmNames: [Substring] { KEM.keyExchangeAlgorithmNames }
 
     init(ourRole: SSHConnectionRole, previousSessionIdentifier: ByteBuffer?) {
         self.ourRole = ourRole
@@ -68,18 +185,12 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
 
         switch ourRole {
         case .client:
-            var publicKey = [UInt8](repeating: 0, count: Self.sntrupPublicKeyBytes)
-            var secretKey = [UInt8](repeating: 0, count: Self.sntrupSecretKeyBytes)
-            publicKey.withUnsafeMutableBufferPointer { pk in
-                secretKey.withUnsafeMutableBufferPointer { sk in
-                    _ = crypto_kem_sntrup761_keypair(pk.baseAddress, sk.baseAddress)
-                }
-            }
-            self.sntrupPublicKey = publicKey
-            self.sntrupSecretKey = secretKey
+            let (publicKey, secretKey) = KEM.keypair()
+            self.kemPublicKey = publicKey
+            self.kemSecretKey = secretKey
         case .server:
-            self.sntrupPublicKey = []
-            self.sntrupSecretKey = []
+            self.kemPublicKey = []
+            self.kemSecretKey = nil
         }
     }
 
@@ -87,7 +198,7 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
         precondition(self.ourRole.isClient, "Only clients may initiate the client side key exchange!")
 
         var buffer = allocator.buffer(capacity: Self.clientPublicValueBytes)
-        buffer.writeBytes(self.sntrupPublicKey)
+        buffer.writeBytes(self.kemPublicKey)
         buffer.writeContiguousBytes(self.x25519Key.publicKey.rawRepresentation)
         return .init(publicKey: buffer)
     }
@@ -103,30 +214,22 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
 
         var clientValue = message.publicKey
         guard clientValue.readableBytes == Self.clientPublicValueBytes,
-            let clientSntrupKey = clientValue.readBytes(length: Self.sntrupPublicKeyBytes),
+            let clientKEMKey = clientValue.readBytes(length: KEM.publicKeyBytes),
             let clientX25519Bytes = clientValue.readBytes(length: Self.x25519PublicKeyBytes)
         else {
             throw NIOSSHError.invalidSSHMessage(
-                reason: "sntrup761x25519 client public value must be exactly \(Self.clientPublicValueBytes) bytes"
+                reason: "hybrid KEM client public value must be exactly \(Self.clientPublicValueBytes) bytes"
             )
         }
 
-        // Encapsulate against the client's sntrup761 key.
-        var ciphertext = [UInt8](repeating: 0, count: Self.sntrupCiphertextBytes)
-        var sntrupKey = [UInt8](repeating: 0, count: Self.sntrupSharedKeyBytes)
-        defer { sntrupKey.resetBytes(in: sntrupKey.indices) }
-        ciphertext.withUnsafeMutableBufferPointer { ct in
-            sntrupKey.withUnsafeMutableBufferPointer { key in
-                clientSntrupKey.withUnsafeBufferPointer { pk in
-                    _ = crypto_kem_sntrup761_enc(ct.baseAddress, key.baseAddress, pk.baseAddress)
-                }
-            }
-        }
+        let (ciphertext, kemKey) = try KEM.encapsulate(to: clientKEMKey)
+        var kemKeyBytes = kemKey
+        defer { kemKeyBytes.resetBytes(in: kemKeyBytes.indices) }
 
         let clientX25519Key = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: clientX25519Bytes)
         let x25519Secret = try self.x25519Key.generatedSharedSecret(with: clientX25519Key)
 
-        var sharedSecret = Self.deriveSharedSecret(sntrupKey: sntrupKey, x25519Secret: x25519Secret)
+        var sharedSecret = Self.deriveSharedSecret(kemKey: kemKeyBytes, x25519Secret: x25519Secret)
         defer { sharedSecret.resetBytes(in: sharedSecret.indices) }
 
         var serverValue = allocator.buffer(capacity: Self.serverPublicValueBytes)
@@ -163,41 +266,34 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
 
         var serverValue = message.publicKey
         guard serverValue.readableBytes == Self.serverPublicValueBytes,
-            let ciphertext = serverValue.readBytes(length: Self.sntrupCiphertextBytes),
+            let ciphertext = serverValue.readBytes(length: KEM.ciphertextBytes),
             let serverX25519Bytes = serverValue.readBytes(length: Self.x25519PublicKeyBytes)
         else {
             throw NIOSSHError.invalidSSHMessage(
-                reason: "sntrup761x25519 server public value must be exactly \(Self.serverPublicValueBytes) bytes"
+                reason: "hybrid KEM server public value must be exactly \(Self.serverPublicValueBytes) bytes"
             )
         }
 
-        // Decapsulate. sntrup761 is an implicit-rejection KEM: a corrupted
-        // ciphertext does not error, it yields a *different* key, and the
-        // handshake then dies verifying the server's exchange-hash
-        // signature below. That is the failure mode the design intends.
-        var sntrupKey = [UInt8](repeating: 0, count: Self.sntrupSharedKeyBytes)
-        defer { sntrupKey.resetBytes(in: sntrupKey.indices) }
-        sntrupKey.withUnsafeMutableBufferPointer { key in
-            ciphertext.withUnsafeBufferPointer { ct in
-                self.sntrupSecretKey.withUnsafeBufferPointer { sk in
-                    _ = crypto_kem_sntrup761_dec(key.baseAddress, ct.baseAddress, sk.baseAddress)
-                }
-            }
+        guard var secretKey = self.kemSecretKey else {
+            throw NIOSSHError.invalidSSHMessage(reason: "hybrid KEM reply without a pending exchange")
         }
-        self.sntrupSecretKey.resetBytes(in: self.sntrupSecretKey.indices)
+        self.kemSecretKey = nil
+        var kemKeyBytes = try KEM.decapsulate(ciphertext, with: &secretKey)
+        defer { kemKeyBytes.resetBytes(in: kemKeyBytes.indices) }
 
         let serverX25519Key = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: serverX25519Bytes)
         let x25519Secret = try self.x25519Key.generatedSharedSecret(with: serverX25519Key)
 
-        var sharedSecret = Self.deriveSharedSecret(sntrupKey: sntrupKey, x25519Secret: x25519Secret)
+        var sharedSecret = Self.deriveSharedSecret(kemKey: kemKeyBytes, x25519Secret: x25519Secret)
         defer { sharedSecret.resetBytes(in: sharedSecret.indices) }
 
-        var clientValue = allocator.buffer(capacity: Self.clientPublicValueBytes)
-        clientValue.writeBytes(self.sntrupPublicKey)
-        clientValue.writeContiguousBytes(self.x25519Key.publicKey.rawRepresentation)
-
         let result = self.finalize(
-            clientPublicValue: clientValue,
+            clientPublicValue: {
+                var clientValue = allocator.buffer(capacity: Self.clientPublicValueBytes)
+                clientValue.writeBytes(self.kemPublicKey)
+                clientValue.writeContiguousBytes(self.x25519Key.publicKey.rawRepresentation)
+                return clientValue
+            }(),
             serverPublicValue: message.publicKey,
             sharedSecret: sharedSecret,
             initialExchangeBytes: &initialExchangeBytes,
@@ -213,17 +309,17 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
         return KeyExchangeResult(sessionID: result.sessionID, keys: result.keys)
     }
 
-    /// `K = SHA-512(sntrup761 key ‖ X25519 shared secret)`, both 32 bytes.
-    private static func deriveSharedSecret(sntrupKey: [UInt8], x25519Secret: SharedSecret) -> [UInt8] {
-        var hasher = SHA512()
-        sntrupKey.withUnsafeBufferPointer { hasher.update(bufferPointer: UnsafeRawBufferPointer($0)) }
+    /// `K = HASH(KEM key ‖ X25519 shared secret)` — the hybrid combiner.
+    private static func deriveSharedSecret(kemKey: [UInt8], x25519Secret: SharedSecret) -> [UInt8] {
+        var hasher = KEM.Hasher()
+        kemKey.withUnsafeBufferPointer { hasher.update(bufferPointer: UnsafeRawBufferPointer($0)) }
         x25519Secret.withUnsafeBytes { hasher.update(bufferPointer: $0) }
         return Array(hasher.finalize())
     }
 
     private struct FinalizedResult {
         var sessionID: ByteBuffer
-        var exchangeHash: SHA512.Digest
+        var exchangeHash: KEM.Hasher.Digest
         var keys: NIOSSHSessionKeys
     }
 
@@ -237,10 +333,9 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
         expectedKeySizes: ExpectedKeySizes
     ) -> FinalizedResult {
         // The exchange hash has the same layout as classical ECDH (RFC 5656
-        // section 4), with one deviation the draft mandates: "Instead of
-        // encoding the shared secret K as 'mpint', it MUST be encoded as
-        // 'string'." That applies everywhere K enters a hash, including the
-        // key derivation below.
+        // section 4), with one deviation both drafts mandate: the shared
+        // secret K is encoded as `string`, not `mpint` — everywhere K
+        // enters a hash, including the key derivation below.
         initialExchangeBytes.writeCompositeSSHString {
             $0.writeSSHHostKey(serverHostKey)
         }
@@ -249,7 +344,7 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
         initialExchangeBytes.writeSSHString(&clientValue)
         initialExchangeBytes.writeSSHString(&serverValue)
 
-        var exchangeHasher = SHA512()
+        var exchangeHasher = KEM.Hasher()
         initialExchangeBytes.withUnsafeReadableBytes { exchangeHasher.update(bufferPointer: $0) }
         exchangeHasher.updateAsSSHString(sharedSecret)
         let exchangeHash = exchangeHasher.finalize()
@@ -258,7 +353,7 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
         if let previousSessionIdentifier = self.previousSessionIdentifier {
             sessionID = previousSessionIdentifier
         } else {
-            var hashBytes = allocator.buffer(capacity: SHA512.Digest.byteCount)
+            var hashBytes = allocator.buffer(capacity: KEM.Hasher.Digest.byteCount)
             hashBytes.writeContiguousBytes(exchangeHash)
             sessionID = hashBytes
         }
@@ -275,17 +370,17 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
 
     private func generateKeys(
         sharedSecret: [UInt8],
-        exchangeHash: SHA512.Digest,
+        exchangeHash: KEM.Hasher.Digest,
         sessionID: ByteBuffer,
         expectedKeySizes: ExpectedKeySizes
     ) -> NIOSSHSessionKeys {
         // RFC 4253 section 7.2, with K encoded as a string (see above).
-        var baseHasher = SHA512()
+        var baseHasher = KEM.Hasher()
         baseHasher.updateAsSSHString(sharedSecret)
         exchangeHash.withUnsafeBytes { baseHasher.update(bufferPointer: $0) }
 
         func deriveKey(_ discriminator: UInt8, _ size: Int) -> [UInt8] {
-            assert(size <= SHA512.Digest.byteCount)
+            assert(size <= KEM.Hasher.Digest.byteCount)
             var hasher = baseHasher
             withUnsafeBytes(of: discriminator) { hasher.update(bufferPointer: $0) }
             hasher.update(data: sessionID.readableBytesView)
@@ -318,7 +413,7 @@ struct SNTRUP761X25519KeyExchange: EllipticCurveKeyExchangeProtocol {
 extension HashFunction {
     /// Hashes `bytes` as an SSH `string`: a 32-bit big-endian length,
     /// then the raw bytes. No mpint normalization — leading zero bytes
-    /// and a set top bit are hashed as-is, per the sntrup761x25519 draft.
+    /// and a set top bit are hashed as-is, per both hybrid KEX drafts.
     fileprivate mutating func updateAsSSHString(_ bytes: [UInt8]) {
         let length = UInt32(bytes.count).bigEndian
         withUnsafeBytes(of: length) { self.update(bufferPointer: $0) }

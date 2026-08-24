@@ -597,16 +597,27 @@ struct SSHKeyExchangeStateMachine {
 }
 
 extension SSHKeyExchangeStateMachine {
-    // For now this is a static list. The hybrid post-quantum exchange leads:
-    // list order is client preference order, and any server that offers
-    // sntrup761x25519 should get it rather than classical ECDH.
-    static let supportedKeyExchangeImplementations: [EllipticCurveKeyExchangeProtocol.Type] = [
-        SNTRUP761X25519KeyExchange.self,
-        EllipticCurveKeyExchange<P384.KeyAgreement.PrivateKey>.self,
-        EllipticCurveKeyExchange<P256.KeyAgreement.PrivateKey>.self,
-        EllipticCurveKeyExchange<P521.KeyAgreement.PrivateKey>.self,
-        EllipticCurveKeyExchange<Curve25519.KeyAgreement.PrivateKey>.self,
-    ]
+    // For now this is a static list. The hybrid post-quantum exchanges
+    // lead: list order is client preference order, and any server that
+    // offers a hybrid should get it rather than classical ECDH. ML-KEM
+    // first, matching OpenSSH >= 9.9's own default order; it is absent
+    // only on Darwin OS generations older than 26, where CryptoKit has
+    // no ML-KEM and sntrup761 still covers the post-quantum case.
+    static let supportedKeyExchangeImplementations: [EllipticCurveKeyExchangeProtocol.Type] = {
+        var implementations: [EllipticCurveKeyExchangeProtocol.Type] = []
+        if #available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, macCatalyst 26.0, visionOS 26.0, *) {
+            implementations.append(MLKEM768X25519KeyExchange.self)
+        }
+        let classical: [EllipticCurveKeyExchangeProtocol.Type] = [
+            SNTRUP761X25519KeyExchange.self,
+            EllipticCurveKeyExchange<P384.KeyAgreement.PrivateKey>.self,
+            EllipticCurveKeyExchange<P256.KeyAgreement.PrivateKey>.self,
+            EllipticCurveKeyExchange<P521.KeyAgreement.PrivateKey>.self,
+            EllipticCurveKeyExchange<Curve25519.KeyAgreement.PrivateKey>.self,
+        ]
+        implementations.append(contentsOf: classical)
+        return implementations
+    }()
 
     static let supportedKeyExchangeAlgorithms: [Substring] = supportedKeyExchangeImplementations.flatMap {
         $0.keyExchangeAlgorithmNames

@@ -154,15 +154,22 @@ final class SNTRUP761X25519KeyExchangeTests: XCTestCase {
         }
     }
 
-    /// The whole point of adding the algorithm: it must be the client's
-    /// first preference, under both its IANA and its @openssh.com name.
-    func testPostQuantumExchangeIsPreferred() {
+    /// The whole point of adding the algorithms: the hybrids must lead the
+    /// preference list — ML-KEM first where the platform has it (matching
+    /// OpenSSH >= 9.9's default order), sntrup761 right behind under both
+    /// its IANA and its @openssh.com name.
+    func testPostQuantumExchangesArePreferred() {
+        var expected: [Substring] = []
+        if #available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, macCatalyst 26.0, visionOS 26.0, *) {
+            expected.append("mlkem768x25519-sha256")
+        }
+        expected.append(contentsOf: ["sntrup761x25519-sha512", "sntrup761x25519-sha512@openssh.com"])
+
         let algorithms = SSHKeyExchangeStateMachine.supportedKeyExchangeAlgorithms
-        XCTAssertEqual(algorithms.first, "sntrup761x25519-sha512")
-        XCTAssertEqual(algorithms.dropFirst().first, "sntrup761x25519-sha512@openssh.com")
+        XCTAssertEqual(Array(algorithms.prefix(expected.count)), expected)
         XCTAssertEqual(
-            NIOSSHSupportedAlgorithms.keyExchangeAlgorithms.first,
-            "sntrup761x25519-sha512"
+            NIOSSHSupportedAlgorithms.keyExchangeAlgorithms.prefix(expected.count),
+            expected.map(String.init)[...]
         )
     }
 
@@ -262,13 +269,96 @@ final class NegotiatedAlgorithmsTests: XCTestCase {
         XCTAssertNoThrow(try channel.activate())
         XCTAssertNoThrow(try channel.interactInMemory())
 
+        // Both in-memory peers are this build, so the shared first
+        // preference must have won: ML-KEM where the platform has it,
+        // sntrup761 otherwise.
+        let expectedKex: String
+        if #available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, macCatalyst 26.0, visionOS 26.0, *) {
+            expectedKex = "mlkem768x25519-sha256"
+        } else {
+            expectedKex = "sntrup761x25519-sha512"
+        }
         for handler in [channel.clientSSHHandler, channel.serverSSHHandler] {
             let negotiated = try XCTUnwrap(try XCTUnwrap(handler).negotiatedAlgorithms)
-            // Both in-memory peers are this build, so the shared first
-            // preference — the post-quantum exchange — must have won.
-            XCTAssertEqual(negotiated.keyExchange, "sntrup761x25519-sha512")
+            XCTAssertEqual(negotiated.keyExchange, expectedKex)
             XCTAssertEqual(negotiated.hostKey, "ssh-ed25519")
             XCTAssertFalse(negotiated.cipher.isEmpty)
+        }
+    }
+}
+
+/// The ML-KEM variant of the hybrid exchange, sharing the generic engine
+/// with sntrup761 — these tests pin what differs: sizes, hash, and the
+/// swift-crypto-backed KEM. Darwin needs the 26.0 OS generation for
+/// CryptoKit's ML-KEM; Linux always has it via BoringSSL.
+@available(macOS 26.0, iOS 26.0, watchOS 26.0, tvOS 26.0, macCatalyst 26.0, visionOS 26.0, *)
+final class MLKEM768X25519KeyExchangeTests: XCTestCase {
+    private func performHandshake(
+        corruptServerResponse: ((inout SSHMessage.KeyExchangeECDHReplyMessage) throws -> Void)? = nil
+    ) throws -> (server: KeyExchangeResult, client: KeyExchangeResult) {
+        let serverHostKey = NIOSSHPrivateKey(ed25519Key: .init())
+        var server = MLKEM768X25519KeyExchange(
+            ourRole: .server([serverHostKey]),
+            previousSessionIdentifier: nil
+        )
+        var client = MLKEM768X25519KeyExchange(ourRole: .client, previousSessionIdentifier: nil)
+
+        var initialExchangeBytes = ByteBufferAllocator().buffer(capacity: 2048)
+        let clientMessage = client.initiateKeyExchangeClientSide(allocator: ByteBufferAllocator())
+        XCTAssertEqual(clientMessage.publicKey.readableBytes, 1216)
+
+        var (serverKeys, serverResponse) = try server.completeKeyExchangeServerSide(
+            clientKeyExchangeMessage: clientMessage,
+            serverHostKey: serverHostKey,
+            initialExchangeBytes: &initialExchangeBytes,
+            allocator: ByteBufferAllocator(),
+            expectedKeySizes: AES256GCMOpenSSHTransportProtection.keySizes
+        )
+        XCTAssertEqual(serverResponse.publicKey.readableBytes, 1120)
+
+        initialExchangeBytes.clear()
+        try corruptServerResponse?(&serverResponse)
+
+        let clientKeys = try client.receiveServerKeyExchangePayload(
+            serverKeyExchangeMessage: serverResponse,
+            initialExchangeBytes: &initialExchangeBytes,
+            allocator: ByteBufferAllocator(),
+            expectedKeySizes: AES256GCMOpenSSHTransportProtection.keySizes
+        )
+        return (serverKeys, clientKeys)
+    }
+
+    func testBasicSuccessfulKeyExchange() throws {
+        let (serverKeys, clientKeys) = try self.performHandshake()
+        XCTAssertEqual(serverKeys.sessionID, clientKeys.sessionID)
+        XCTAssertEqual(serverKeys.keys.inboundEncryptionKey, clientKeys.keys.outboundEncryptionKey)
+        XCTAssertEqual(serverKeys.keys.outboundEncryptionKey, clientKeys.keys.inboundEncryptionKey)
+    }
+
+    func testTamperedCiphertextFailsSignatureValidation() throws {
+        XCTAssertThrowsError(
+            try self.performHandshake(corruptServerResponse: { response in
+                var corrupted = ByteBufferAllocator().buffer(capacity: 1120)
+                var original = response.publicKey
+                let firstByte = original.readInteger(as: UInt8.self)!
+                corrupted.writeInteger(firstByte ^ 0xFF)
+                corrupted.writeBytes(original.readableBytesView)
+                response.publicKey = corrupted
+            })
+        ) { error in
+            XCTAssertEqual((error as? NIOSSHError).map { $0.type }, .invalidExchangeHashSignature)
+        }
+    }
+
+    func testWrongLengthServerValueIsRejected() throws {
+        XCTAssertThrowsError(
+            try self.performHandshake(corruptServerResponse: { response in
+                var truncated = response.publicKey
+                truncated.moveWriterIndex(to: truncated.writerIndex - 1)
+                response.publicKey = truncated
+            })
+        ) { error in
+            XCTAssertEqual((error as? NIOSSHError).map { $0.type }, .invalidSSHMessage)
         }
     }
 }
