@@ -2295,16 +2295,43 @@ extension ChildChannelMultiplexerTests {
                 )
             )
         )
+        sibling.read()
         try h.multiplexer.receiveMessage(self.data(peerChannelID: siblingID, data: bytes))
+        h.multiplexer.parentChannelReadComplete()
         XCTAssertEqual(recorder.value.reads, [.init(type: .channel, data: .byteBuffer(bytes))])
         sibling.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(bytes)), promise: nil)
         XCTAssertTrue(sibling.isActive)
         XCTAssertTrue(h.delegate._channel.isActive)
-        self.assertAbortTerminal(child, h)
+        let repeatedEvent = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        let originalTerminal = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        child.closeFuture.whenFailure { originalTerminal.value = $0 }
+        child.triggerUserOutboundEvent(SSHChannelAbortEvent()).whenFailure { repeatedEvent.value = $0 }
+        h.eventLoop.run()
+        XCTAssertEqual((originalTerminal.value as? NIOSSHError)?.type, .channelAborted)
+        XCTAssertEqual(repeatedEvent.value as? ChannelError, .ioOnClosedChannel)
         XCTAssertEqual(self.closeCount(h, peerID: 10), 1)
         let available = h.multiplexer.availableChannelReservations
         try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
         XCTAssertEqual(h.multiplexer.availableChannelReservations, available + 1)
+    }
+
+    func testDuplicateCloseAfterAbortRefusesBeforeDeferredCleanupFinishes() throws {
+        let h = self.harnessForbiddingInboundChannels()
+        defer { h.finish() }
+        let (child, _) = try self.activeAbortTestChild(h, peerID: 19)
+        let terminal = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        let duplicate = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        child.closeFuture.whenFailure { terminal.value = $0 }
+        child.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        child.close().whenFailure { duplicate.value = $0 }
+        // No event-loop tick yet: do not confuse immediate close refusal with
+        // actual handler removal and terminal cleanup, which still must join.
+        XCTAssertEqual(duplicate.value as? ChannelError, .alreadyClosed)
+        XCTAssertNil(terminal.value)
+        h.eventLoop.run()
+        XCTAssertEqual((terminal.value as? NIOSSHError)?.type, .channelAborted)
+        XCTAssertEqual(self.closeCount(h, peerID: 19), 1)
+        XCTAssertTrue(h.delegate._channel.isActive)
     }
 
     func testAbortAfterOrdinaryCloseDoesNotSendDuplicateClose() throws {
@@ -2315,10 +2342,13 @@ extension ChildChannelMultiplexerTests {
             if peerFirst {
                 try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
                 h.eventLoop.run()
-                let result = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
-                child.triggerUserOutboundEvent(SSHChannelAbortEvent()).whenComplete { result.value = $0 }
+                let original = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
+                let repeatedEvent = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+                child.closeFuture.whenComplete { original.value = $0 }
+                child.triggerUserOutboundEvent(SSHChannelAbortEvent()).whenFailure { repeatedEvent.value = $0 }
                 h.eventLoop.run()
-                guard case .success? = result.value else { return XCTFail("Clean terminal result changed") }
+                guard case .success? = original.value else { return XCTFail("Clean terminal result changed") }
+                XCTAssertEqual(repeatedEvent.value as? ChannelError, .ioOnClosedChannel)
             } else {
                 let close = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
                 child.close().whenFailure { close.value = $0 }

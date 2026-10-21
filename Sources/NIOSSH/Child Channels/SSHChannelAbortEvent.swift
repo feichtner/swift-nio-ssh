@@ -19,7 +19,8 @@
 /// failing with `NIOSSHError.ErrorType.channelAborted`. The parent and siblings
 /// are preserved. A protocol reservation remains until the peer completes its
 /// open/close handshake; this is not remote-process termination or rollback.
-/// Repeated aborts follow the child's original terminal result.
+/// The child's `closeFuture` retains its original terminal result. Events sent
+/// after pipeline removal fail as closed; join actual cleanup with `closeFuture`.
 public struct SSHChannelAbortEvent: Sendable {
     public init() {}
 }

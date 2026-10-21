@@ -337,7 +337,9 @@ extension SSHChildChannel: Channel, ChannelCore {
 
     public func close0(error: Error, mode: CloseMode, promise: EventLoopPromise<Void>?) {
         if self.didClose {
-            self.closeFuture.cascade(to: promise)
+            // Preserve immediate duplicate-close refusal: cleanup joins use
+            // closeFuture, which may still need an event-loop tick.
+            promise?.fail(ChannelError.alreadyClosed)
             return
         }
         // Can't process this right now.

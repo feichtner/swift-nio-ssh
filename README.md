@@ -153,8 +153,9 @@ Forwarded channels are then sent from server to client using the `.forwardedTCPI
 Send `SSHChannelAbortEvent()` with `child.triggerUserOutboundEvent` to terminate
 one dedicated child locally without waiting for peer CLOSE. The event promise
 and `child.closeFuture` finish after local handlers are removed, with
-`NIOSSHError.ErrorType.channelAborted`; repeated aborts retain the original
-terminal result. The SSH parent and other children remain available.
+`NIOSSHError.ErrorType.channelAborted`. The SSH parent and other children remain
+available. `closeFuture` retains its original result; events sent after pipeline
+removal fail as closed. Join actual cleanup with `closeFuture`.
 
 Local termination does not acknowledge remote CLOSE, stop a remote process or
 undo an acknowledged write. The connection retains the channel ID until its
