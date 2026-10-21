@@ -2759,7 +2759,11 @@ extension ChildChannelMultiplexerTests {
         var callbacks = 0
         h.delegate.beforeTerminalWrite = {
             callbacks += 1
-            XCTAssertNoThrow(try h.multiplexer.receiveMessage(self.close(peerChannelID: id)))
+            do {
+                try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+            } catch {
+                XCTFail("Reentrant peer CLOSE refused: \(error)")
+            }
             h.multiplexer.drainTerminalControls()
             XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
         }
