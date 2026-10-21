@@ -614,6 +614,7 @@ extension SSHChildChannel: Channel, ChannelCore {
 
         self.eventLoop.execute {
             self.removeHandlers(pipeline: self.pipeline)
+            self.writePendingToMultiplexer()
             self.closePromise.succeed(())
             self.multiplexer.childChannelClosed(channelID: self.state.localChannelIdentifier)
         }

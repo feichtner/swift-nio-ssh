@@ -2630,6 +2630,7 @@ extension ChildChannelMultiplexerTests {
                 h.delegate.canSendChannelControlMessages = false
                 if ordinaryCloseFirst { child.close(promise: nil) }
                 self.assertAbortTerminal(child, h)
+                XCTAssertTrue(h.multiplexer.hasOwedTerminalControls)
                 XCTAssertEqual(self.closeCount(h, peerID: 71), 0)
                 XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
                 if peerCloseFirst {
@@ -2650,6 +2651,7 @@ extension ChildChannelMultiplexerTests {
                 h.multiplexer.drainTerminalControls()
                 h.multiplexer.drainTerminalControls()
                 XCTAssertEqual(self.closeCount(h, peerID: 71), 1)
+                XCTAssertFalse(h.multiplexer.hasOwedTerminalControls)
                 XCTAssertEqual(h.multiplexer.availableChannelReservations, peerCloseFirst ? 1 : 0)
                 if !peerCloseFirst { try h.multiplexer.receiveMessage(self.close(peerChannelID: id)) }
                 XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
@@ -2723,6 +2725,7 @@ extension ChildChannelMultiplexerTests {
         }
         h.delegate.canSendChannelControlMessages = false
         for (child, _) in originals { self.assertAbortTerminal(child, h) }
+        XCTAssertTrue(h.multiplexer.hasOwedTerminalControls)
         XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
         XCTAssertFalse(
             h.flushedMessages.contains {
@@ -2741,6 +2744,7 @@ extension ChildChannelMultiplexerTests {
         h.delegate.canSendChannelControlMessages = false
         self.assertAbortTerminal(last, h)
         h.multiplexer.parentChannelInactive()
+        XCTAssertFalse(h.multiplexer.hasOwedTerminalControls)
         h.delegate.canSendChannelControlMessages = true
         h.multiplexer.drainTerminalControls()
         XCTAssertEqual(self.closeCount(h, peerID: 500), 0)
@@ -2882,5 +2886,60 @@ extension ChildChannelMultiplexerTests {
                 }
             }
         }
+    }
+}
+
+extension ChildChannelMultiplexerTests {
+    func testCleanCloseReplySurvivesDeferredCleanupBeforeReadComplete() throws {
+        for rekeying in [false, true] {
+            let h = self.harness(maximumReservations: 1)
+            defer { h.finish() }
+            let (child, id) = try self.activeAbortTestChild(h, peerID: 82)
+            let terminal = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
+            child.closeFuture.whenComplete { terminal.value = $0 }
+            h.delegate.canSendChannelControlMessages = !rekeying
+            try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+            XCTAssertEqual(self.closeCount(h, peerID: 82), 0)
+            // Deliberately run cleanup BEFORE the parent's read-completion.
+            h.eventLoop.run()
+            guard case .success? = terminal.value else { return XCTFail("Clean close did not finish locally") }
+            XCTAssertEqual(self.closeCount(h, peerID: 82), rekeying ? 0 : 1)
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, rekeying ? 0 : 1)
+            XCTAssertEqual(h.multiplexer.hasOwedTerminalControls, rekeying)
+            h.multiplexer.parentChannelReadComplete()
+            h.delegate.canSendChannelControlMessages = true
+            h.multiplexer.drainTerminalControls()
+            h.eventLoop.run()
+            XCTAssertEqual(self.closeCount(h, peerID: 82), 1)
+            XCTAssertFalse(h.multiplexer.hasOwedTerminalControls)
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
+            h.multiplexer.nextChannelID = id
+            let (replacement, replacementID) = try self.activeAbortTestChild(h, peerID: 83)
+            XCTAssertEqual(replacementID, id)
+            XCTAssertTrue(replacement.isActive)
+            XCTAssertTrue(h.delegate._channel.isActive)
+        }
+    }
+
+    func testReservedTerminalCallerPromiseRefusesWithoutDroppingOwedClose() throws {
+        let h = self.harness(maximumReservations: 1)
+        defer { h.finish() }
+        let (child, id) = try self.activeAbortTestChild(h, peerID: 84)
+        h.delegate.canSendChannelControlMessages = false
+        let caller = h.eventLoop.makePromise(of: Void.self)
+        let outcome = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        caller.futureResult.whenFailure { outcome.value = $0 }
+        h.multiplexer.writeFromChannel(self.close(peerChannelID: 84), caller, from: id)
+        XCTAssertEqual(outcome.value as? ChannelError, .operationUnsupported)
+        XCTAssertTrue(h.multiplexer.hasOwedTerminalControls)
+        self.assertAbortTerminal(child, h)
+        try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+        XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
+        h.delegate.canSendChannelControlMessages = true
+        h.multiplexer.drainTerminalControls()
+        XCTAssertEqual(self.closeCount(h, peerID: 84), 1)
+        XCTAssertFalse(h.multiplexer.hasOwedTerminalControls)
+        XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
+        XCTAssertTrue(h.delegate._channel.isActive)
     }
 }

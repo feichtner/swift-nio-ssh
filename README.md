@@ -174,3 +174,9 @@ failure explicitly fails the parent transport rather than silently losing the
 response. Capacity-rejection responses have no admitted reservation: if such a
 response cannot be serialized, the transport fails instead of growing an
 unbounded overflow queue. This exceptional failure may also terminate siblings.
+
+The 256-reservation bound is fixed; no public pressure/configuration API is
+provided. Applications observe `channelResourceLimit`, rather than inferring
+that local cleanup freed a peer's unfinished handshake. Local cleanup requires
+event-loop progress and cannot cancel an application-owned initializer task.
+The abort event promise mirrors local `closeFuture`, not peer acknowledgement.

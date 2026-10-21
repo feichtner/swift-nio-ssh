@@ -1035,6 +1035,8 @@ extension EndToEndTests {
                 XCTAssertEqual(errors.errors.count, 1)
                 XCTAssertEqual(errors.errors.first as? EndToEndTestError, .injectedTerminalWriteFailure)
                 XCTAssertFalse(pair.client.isActive)
+                // A duplicate failure after parent teardown is not a new error.
+                handler.terminalControlWriteFailed(EndToEndTestError.injectedTerminalWriteFailure)
                 XCTAssertThrowsError(try pair.client.throwIfErrorCaught())
                 XCTAssertNoThrow(try pair.client.throwIfErrorCaught())
                 pair.run()
@@ -1043,5 +1045,34 @@ extension EndToEndTests {
                 XCTAssertEqual(errors.errors.count, 1)
             }
         }
+    }
+}
+
+extension EndToEndTests {
+    func testOrdinaryDataTrafficDoesNotScheduleTerminalControlTasks() throws {
+        let pair = BackToBackEmbeddedChannel()
+        defer { XCTAssertNoThrow(try pair.finish()) }
+        try pair.configureWithHarness(TestHarness())
+        try pair.activate()
+        try pair.interactInMemory()
+        let child = try pair.createNewChannel()
+        try pair.interactInMemory()
+        let peer = try XCTUnwrap(pair.activeServerChannels.first)
+        let reads = NIOLoopBound(ReadRecordingHandler(), eventLoop: peer.eventLoop)
+        try peer.pipeline.syncOperations.addHandler(reads.value)
+        let client = try XCTUnwrap(pair.clientSSHHandler)
+        let server = try XCTUnwrap(pair.serverSSHHandler)
+        let payload = SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(string: "ordinary data")))
+        for _ in 0..<8 {
+            child.writeAndFlush(payload, promise: nil)
+            // Observe immediately, before any queued task could clear the flag.
+            XCTAssertFalse(client.terminalControlDrainScheduled)
+            let packet = try XCTUnwrap(pair.client.readOutbound(as: IOData.self))
+            try pair.server.writeInbound(packet)
+            XCTAssertFalse(server.terminalControlDrainScheduled)
+        }
+        XCTAssertEqual(reads.value.reads, Array(repeating: payload, count: 8))
+        XCTAssertTrue(child.isActive)
+        XCTAssertTrue(peer.isActive)
     }
 }

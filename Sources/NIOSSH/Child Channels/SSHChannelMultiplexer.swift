@@ -31,6 +31,24 @@ final class SSHChannelMultiplexer {
     // unbounded queue or a live child. Only one control may be owed per ID.
     private var erroredChannels: [UInt32: TerminalReservation]
     private var drainingTerminalControls = false
+    // Count the union of live/quarantined IDs, and ledger entries with an owed
+    // message. Both are event-loop confined; admission and idle I/O stay O(1).
+    private var reservationCount = 0
+    private var owedTerminalControlCount = 0
+
+    var hasOwedTerminalControls: Bool { self.owedTerminalControlCount != 0 }
+
+    private func setTerminalReservation(_ reservation: TerminalReservation, for id: UInt32) {
+        if self.erroredChannels[id]?.owed != nil { self.owedTerminalControlCount -= 1 }
+        if reservation.owed != nil { self.owedTerminalControlCount += 1 }
+        self.erroredChannels[id] = reservation
+    }
+
+    private func removeTerminalReservation(for id: UInt32) {
+        guard let previous = self.erroredChannels.removeValue(forKey: id) else { return }
+        if previous.owed != nil { self.owedTerminalControlCount -= 1 }
+        if self.channels[id] == nil { self.reservationCount -= 1 }
+    }
     private let maximumReservations: Int
 
     // This object can cause a reference cycle, so we require it to be optional so that we can
@@ -77,6 +95,8 @@ final class SSHChannelMultiplexer {
         self.childChannelInitializer = nil
         self.canCreateNewChannels = false
         self.erroredChannels.removeAll(keepingCapacity: false)
+        self.owedTerminalControlCount = 0
+        self.reservationCount = self.channels.count
     }
 }
 
@@ -95,9 +115,9 @@ extension SSHChannelMultiplexer {
         if let localID, self.erroredChannels[localID] == nil, self.channels[localID] != nil {
             switch message {
             case .channelClose:
-                self.erroredChannels[localID] = TerminalReservation(phase: .awaitingClose, sent: false)
+                self.setTerminalReservation(TerminalReservation(phase: .awaitingClose, sent: false), for: localID)
             case .channelOpenFailure:
-                self.erroredChannels[localID] = TerminalReservation(phase: .rejectingOpen, sent: false)
+                self.setTerminalReservation(TerminalReservation(phase: .rejectingOpen, sent: false), for: localID)
             default: break
             }
         }
@@ -107,10 +127,12 @@ extension SSHChannelMultiplexer {
                 .channelOpenFailure where reservation.phase == .rejectingOpen:
                 // Terminal cleanup uses nil promises. Its public completion is
                 // local closeFuture, not a claim that the peer received this.
-                precondition(promise == nil)
+                // Unexpected promise-bearing internal calls cannot claim wire
+                // acknowledgement. Refuse that promise without losing cleanup.
+                defer { promise?.fail(ChannelError.operationUnsupported) }
                 if !reservation.sent && !reservation.sending && reservation.owed == nil {
                     reservation.owed = message
-                    self.erroredChannels[localID] = reservation
+                    self.setTerminalReservation(reservation, for: localID)
                 }
                 self.drainTerminalControls()
                 return
@@ -121,7 +143,7 @@ extension SSHChannelMultiplexer {
     }
 
     func drainTerminalControls() {
-        guard !self.drainingTerminalControls, let delegate = self.delegate else { return }
+        guard self.hasOwedTerminalControls, !self.drainingTerminalControls, let delegate = self.delegate else { return }
         self.drainingTerminalControls = true
         defer { self.drainingTerminalControls = false }
         // Snapshot IDs, then revalidate each original reservation after every
@@ -131,7 +153,7 @@ extension SSHChannelMultiplexer {
             guard var reservation = self.erroredChannels[id], let message = reservation.owed else { continue }
             reservation.owed = nil
             reservation.sending = true
-            self.erroredChannels[id] = reservation
+            self.setTerminalReservation(reservation, for: id)
             do {
                 try delegate.writeTerminalControl(message)
             } catch {
@@ -144,9 +166,9 @@ extension SSHChannelMultiplexer {
             current.sending = false
             current.sent = true
             if current.phase == .rejectingOpen || current.peerClosed {
-                self.erroredChannels.removeValue(forKey: id)
+                self.removeTerminalReservation(for: id)
             } else {
-                self.erroredChannels[id] = current
+                self.setTerminalReservation(current, for: id)
             }
             delegate.flushFromChildChannel()
         }
@@ -165,37 +187,39 @@ extension SSHChannelMultiplexer {
     func childChannelClosed(channelID: UInt32) {
         // This should never return `nil`, but we don't want to assert on it because
         // even if the object was never in the map, nothing bad will happen: it's gone!
-        self.channels.removeValue(forKey: channelID)
+        let wasLive = self.channels.removeValue(forKey: channelID) != nil
         if var reservation = self.erroredChannels[channelID] {
             reservation.peerClosed = true
             if reservation.sent {
-                self.erroredChannels.removeValue(forKey: channelID)
+                self.removeTerminalReservation(for: channelID)
             } else {
-                self.erroredChannels[channelID] = reservation
+                self.setTerminalReservation(reservation, for: channelID)
             }
+        } else if wasLive {
+            self.reservationCount -= 1
         }
     }
 
     func childChannelErrored(channelID: UInt32, quarantine: Quarantine?) {
-        self.channels.removeValue(forKey: channelID)
+        let wasLive = self.channels.removeValue(forKey: channelID) != nil
+        guard wasLive || self.erroredChannels[channelID] != nil else { return }
         if self.canCreateNewChannels, let quarantine {
             if var retained = self.erroredChannels[channelID] {
                 retained.phase = quarantine
-                self.erroredChannels[channelID] = retained
+                self.setTerminalReservation(retained, for: channelID)
             } else {
-                self.erroredChannels[channelID] = TerminalReservation(
-                    phase: quarantine,
-                    // Only this multiplexer can prove serialization. A child
-                    // may have set sentClose while CLOSE is still queued.
-                    sent: false
+                self.setTerminalReservation(
+                    TerminalReservation(phase: quarantine, sent: false),
+                    for: channelID
                 )
             }
+        } else if wasLive && self.erroredChannels[channelID] == nil {
+            self.reservationCount -= 1
         }
     }
 
     var availableChannelReservations: Int {
-        self.maximumReservations - self.channels.count
-            - self.erroredChannels.keys.filter { self.channels[$0] == nil }.count
+        self.maximumReservations - self.reservationCount
     }
 
     var canReserveChannel: Bool {
@@ -214,7 +238,7 @@ extension SSHChannelMultiplexer {
             if let live = self.channels[localID] {
                 if case .channelClose = message {
                     reservation.peerClosed = true
-                    self.erroredChannels[localID] = reservation
+                    self.setTerminalReservation(reservation, for: localID)
                 }
                 live.receiveInboundMessage(message)
                 return
@@ -223,18 +247,18 @@ extension SSHChannelMultiplexer {
             case .channelOpenConfirmation(let reply) where reservation.phase == .awaitingOpenResponse:
                 reservation.phase = .awaitingClose
                 reservation.sent = false
-                self.erroredChannels[localID] = reservation
+                self.setTerminalReservation(reservation, for: localID)
                 self.writeFromChannel(.channelClose(.init(recipientChannel: reply.senderChannel)), nil, from: localID)
             case .channelOpenFailure where reservation.phase == .awaitingOpenResponse:
-                self.erroredChannels.removeValue(forKey: localID)
+                self.removeTerminalReservation(for: localID)
             case .channelClose where reservation.phase == .awaitingClose:
                 // An ACK arriving before our queued CLOSE is serialized must
                 // not release its ID or discard the required response.
                 if reservation.sent && !reservation.sending {
-                    self.erroredChannels.removeValue(forKey: localID)
+                    self.removeTerminalReservation(for: localID)
                 } else {
                     reservation.peerClosed = true
-                    self.erroredChannels[localID] = reservation
+                    self.setTerminalReservation(reservation, for: localID)
                 }
             default: break
             }
@@ -323,6 +347,8 @@ extension SSHChannelMultiplexer {
     func parentChannelInactive() {
         self.canCreateNewChannels = false
         self.erroredChannels.removeAll(keepingCapacity: false)
+        self.owedTerminalControlCount = 0
+        self.reservationCount = self.channels.count
         for channel in Array(self.channels.values) {
             channel.parentChannelInactive()
         }
@@ -370,6 +396,7 @@ extension SSHChannelMultiplexer {
         )  // The initial outbound window size is presumed to be 0 until we're told otherwise.
 
         self.channels[channelID] = channel
+        self.reservationCount += 1
         return channel
     }
 

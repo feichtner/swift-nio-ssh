@@ -48,10 +48,12 @@ public final class NIOSSHHandler {
     // Whether we're expecting a channelReadComplete.
     private var expectingChannelReadComplete: Bool = false
     private var writingFrame = false
-    private var terminalControlDrainScheduled = false
+    private(set) var terminalControlDrainScheduled = false
 
     private func scheduleTerminalControlDrain() {
-        guard !self.terminalControlDrainScheduled, let context = self.context else { return }
+        guard self.multiplexer?.hasOwedTerminalControls == true, self.canSendChannelControlMessages,
+            !self.terminalControlDrainScheduled, let context = self.context
+        else { return }
         self.terminalControlDrainScheduled = true
         let owner = NIOLoopBound(self, eventLoop: context.eventLoop)
         context.eventLoop.execute {
@@ -601,7 +603,8 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
     }
 
     func terminalControlWriteFailed(_ error: Error) {
-        guard let context = self.context else { return }
+        // A parent already inactive needs no second close or teardown error.
+        guard let context = self.context, context.channel.isActive else { return }
         context.fireErrorCaught(error)
         context.close(promise: nil)
     }
