@@ -34,7 +34,7 @@ jobs:
     outputs:
       main_moved: ${{ steps.diff.outputs.main_moved }}
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - id: diff
         name: Compare upstream with the reviewed baseline
         env:
@@ -51,7 +51,7 @@ jobs:
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: "*"
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: feterm-patches
           fetch-depth: 0

@@ -1,7 +1,7 @@
 {
-  "advisories": [
-    "GHSA-998x-vgvp-xwpc"
-  ],
+  "advisories": {
+    "GHSA-998x-vgvp-xwpc": "2026-07-17T17:05:34Z"
+  },
   "main": "149f32ffacda5770e513cb41bd175e3d6ef77ce3",
   "pulls": {
     "125": {

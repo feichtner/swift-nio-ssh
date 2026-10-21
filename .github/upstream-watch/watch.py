@@ -26,12 +26,15 @@ import subprocess
 import sys
 
 UPSTREAM = "apple/swift-nio-ssh"
+REPO = f"https://github.com/{UPSTREAM}"
 
 
 def gh(path):
     out = subprocess.run(
         ["gh", "api", "--paginate", "--slurp", path],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout
     pages = json.loads(out)
     if pages and isinstance(pages[0], list):
@@ -43,59 +46,93 @@ def current():
     main = gh(f"repos/{UPSTREAM}/commits/main")["sha"]
     releases = gh(f"repos/{UPSTREAM}/releases?per_page=100")
     release = releases[0]["tag_name"] if releases else None
-    advisories = sorted(a["ghsa_id"] for a in gh(f"repos/{UPSTREAM}/security-advisories?per_page=100"))
+    # Keyed by revision time, so an edited advisory (a wider vulnerable
+    # range, a new patched version) is reported, not only a new one.
+    advisories = {
+        a["ghsa_id"]: a["updated_at"]
+        for a in gh(f"repos/{UPSTREAM}/security-advisories?per_page=100")
+    }
     pulls = {}
     for pr in gh(f"repos/{UPSTREAM}/pulls?state=open&per_page=100"):
-        files = gh(f"repos/{UPSTREAM}/pulls/{pr['number']}/files?per_page=100")
+        number = pr["number"]
+        files = gh(f"repos/{UPSTREAM}/pulls/{number}/files?per_page=100")
         if any(f["filename"].startswith("Sources/") for f in files):
-            pulls[str(pr["number"])] = {"head": pr["head"]["sha"], "title": pr["title"]}
-    return {"main": main, "release": release, "advisories": advisories, "pulls": pulls}
+            pulls[str(number)] = {"head": pr["head"]["sha"], "title": pr["title"]}
+    return {
+        "main": main,
+        "release": release,
+        "advisories": advisories,
+        "pulls": pulls,
+    }
 
 
 def diff(base, now):
     lines = []
     if now["main"] != base["main"]:
-        lines.append(f"- upstream main moved: `{base['main'][:12]}` → `{now['main'][:12]}` "
-                     f"([compare](https://github.com/{UPSTREAM}/compare/{base['main']}...{now['main']}))")
+        compare = f"{REPO}/compare/{base['main']}...{now['main']}"
+        lines.append(
+            f"- upstream main moved: `{base['main'][:12]}` → "
+            f"`{now['main'][:12]}` ([compare]({compare}))"
+        )
     if now["release"] != base["release"]:
         lines.append(f"- new release: `{base['release']}` → `{now['release']}`")
-    for ghsa in sorted(set(now["advisories"]) - set(base["advisories"])):
-        lines.append(f"- **new security advisory** [{ghsa}](https://github.com/{UPSTREAM}/security/advisories/{ghsa})")
+    for ghsa, updated in sorted(now["advisories"].items()):
+        link = f"[{ghsa}]({REPO}/security/advisories/{ghsa})"
+        if ghsa not in base["advisories"]:
+            lines.append(f"- **new security advisory** {link}")
+        elif base["advisories"][ghsa] != updated:
+            lines.append(f"- **security advisory revised** {link} at {updated}")
     for number, pr in sorted(now["pulls"].items(), key=lambda kv: int(kv[0])):
         old = base["pulls"].get(number)
-        link = f"[#{number}](https://github.com/{UPSTREAM}/pull/{number}) {pr['title']}"
+        link = f"[#{number}]({REPO}/pull/{number}) {pr['title']}"
         if old is None:
             lines.append(f"- new source PR {link}")
         elif old["head"] != pr["head"]:
-            lines.append(f"- source PR updated {link}: `{old['head'][:12]}` → `{pr['head'][:12]}`")
+            lines.append(
+                f"- source PR updated {link}: "
+                f"`{old['head'][:12]}` → `{pr['head'][:12]}`"
+            )
     for number in sorted(set(base["pulls"]) - set(now["pulls"]), key=int):
-        lines.append(f"- source PR #{number} closed or merged upstream: {base['pulls'][number]['title']}")
+        title = base["pulls"][number]["title"]
+        lines.append(f"- source PR #{number} closed or merged upstream: {title}")
     return lines
 
 
+def report(lines):
+    if not lines:
+        return "## Upstream swift-nio-ssh: nothing new since the baseline\n"
+    ack = (
+        "Review, then acknowledge by updating "
+        "`.github/upstream-watch/baseline.json` with the current state "
+        "the job log prints after this summary."
+    )
+    parts = ["## Upstream swift-nio-ssh moved", "\n".join(lines), ack]
+    return "\n\n".join(parts) + "\n"
+
+
 def main(argv):
-    base = json.load(open(argv[1]))
+    with open(argv[1]) as f:
+        base = json.load(f)
     now = current()
     if "--write-current" in argv:
         with open(argv[argv.index("--write-current") + 1], "w") as f:
             json.dump(now, f, indent=2, sort_keys=True)
             f.write("\n")
     lines = diff(base, now)
-    summary = os.environ.get("GITHUB_STEP_SUMMARY")
-    text = ("## Upstream swift-nio-ssh moved\n\n" + "\n".join(lines)
-            + "\n\nReview, then acknowledge by updating `.github/upstream-watch/baseline.json` "
-              "with the current state the job log prints after this summary.\n") if lines else \
-           "## Upstream swift-nio-ssh: nothing new since the baseline\n"
+    text = report(lines)
     print(text)
     if lines:
         print("Current state (paste into baseline.json once reviewed):")
         print(json.dumps(now, indent=2, sort_keys=True))
+    summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as f:
             f.write(text)
-    if os.environ.get("GITHUB_OUTPUT"):
-        with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-            f.write(f"main_moved={'true' if now['main'] != base['main'] else 'false'}\n")
+    output = os.environ.get("GITHUB_OUTPUT")
+    if output:
+        moved = "true" if now["main"] != base["main"] else "false"
+        with open(output, "a") as f:
+            f.write(f"main_moved={moved}\n")
     return 1 if lines else 0
 
 
