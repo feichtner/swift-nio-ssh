@@ -2943,3 +2943,34 @@ extension ChildChannelMultiplexerTests {
         XCTAssertTrue(h.delegate._channel.isActive)
     }
 }
+
+extension ChildChannelMultiplexerTests {
+    func testParentTeardownRefusesWritesAndDiscardsOwedControlsBeforeDeferredCleanup() throws {
+        for removeHandler in [false, true] {
+            let h = self.harness(maximumReservations: 1)
+            defer { h.finish() }
+            let (child, id) = try self.activeAbortTestChild(h, peerID: 85)
+            h.delegate.canSendChannelControlMessages = false
+            child.close(promise: nil)
+            try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+            XCTAssertTrue(h.multiplexer.hasOwedTerminalControls)
+            h.multiplexer.parentChannelInactive()
+            if removeHandler { h.multiplexer.parentHandlerRemoved() }
+            XCTAssertFalse(h.multiplexer.hasOwedTerminalControls)
+            let caller = h.eventLoop.makePromise(of: Void.self)
+            let outcome = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+            caller.futureResult.whenFailure { outcome.value = $0 }
+            h.multiplexer.writeFromChannel(self.close(peerChannelID: 85), caller, from: id)
+            XCTAssertEqual(outcome.value as? ChannelError, .ioOnClosedChannel)
+            h.delegate.canSendChannelControlMessages = true
+            h.multiplexer.drainTerminalControls()
+            let terminal = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
+            child.closeFuture.whenComplete { terminal.value = $0 }
+            h.eventLoop.run()
+            guard case .success? = terminal.value else { return XCTFail("Deferred cleanup did not join") }
+            XCTAssertEqual(self.closeCount(h, peerID: 85), 0)
+            XCTAssertFalse(h.multiplexer.hasOwedTerminalControls)
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
+        }
+    }
+}

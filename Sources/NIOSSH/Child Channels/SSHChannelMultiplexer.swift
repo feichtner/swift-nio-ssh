@@ -105,7 +105,7 @@ final class SSHChannelMultiplexer {
 extension SSHChannelMultiplexer {
     /// An `SSHChildChannel` has issued a write.
     func writeFromChannel(_ message: SSHMessage, _ promise: EventLoopPromise<Void>?, from localID: UInt32? = nil) {
-        guard let delegate = self.delegate else {
+        guard self.canCreateNewChannels, let delegate = self.delegate else {
             promise?.fail(ChannelError.ioOnClosedChannel)
             return
         }
@@ -143,13 +143,15 @@ extension SSHChannelMultiplexer {
     }
 
     func drainTerminalControls() {
-        guard self.hasOwedTerminalControls, !self.drainingTerminalControls, let delegate = self.delegate else { return }
+        guard self.canCreateNewChannels, self.hasOwedTerminalControls, !self.drainingTerminalControls,
+            let delegate = self.delegate
+        else { return }
         self.drainingTerminalControls = true
         defer { self.drainingTerminalControls = false }
         // Snapshot IDs, then revalidate each original reservation after every
         // outcall. No captured writability or child liveness can authorize it.
         for id in Array(self.erroredChannels.keys) {
-            guard delegate.canSendChannelControlMessages else { return }
+            guard self.canCreateNewChannels, delegate.canSendChannelControlMessages else { return }
             guard var reservation = self.erroredChannels[id], let message = reservation.owed else { continue }
             reservation.owed = nil
             reservation.sending = true
