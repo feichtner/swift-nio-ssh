@@ -110,6 +110,10 @@ final class SSHChildChannel {
     /// A promise from the user that will be fired when the channel goes active.
     private var userActivatePromise: EventLoopPromise<Channel>?
 
+    /// Kept separate so ordinary TCP shutdown retains initializer completion timing.
+    /// An explicit local abort may take this promise without waiting for the initializer.
+    private var initializingUserActivatePromise: EventLoopPromise<Channel>?
+
     internal convenience init(
         allocator: ByteBufferAllocator,
         parent: Channel,
@@ -394,6 +398,9 @@ extension SSHChildChannel: Channel, ChannelCore {
 
     public func triggerUserOutboundEvent0(_ event: Any, promise: EventLoopPromise<Void>?) {
         if event is SSHChannelAbortEvent {
+            let initializing = self.initializingUserActivatePromise
+            self.initializingUserActivatePromise = nil
+            self.closeFuture.cascadeFailure(to: initializing)
             self.closeFuture.cascade(to: promise)
             self.errorEncountered(error: NIOSSHError.channelAborted)
             return
@@ -461,7 +468,7 @@ extension SSHChildChannel: Channel, ChannelCore {
         self.type = channelType
         // Retain the caller's activation promise before any initializer can
         // suspend, so abort never waits on application initialization.
-        self.userActivatePromise = userPromise
+        self.initializingUserActivatePromise = userPromise
 
         // We need to configure this channel. This involves doing four things:
         // 1. Setting our autoRead state from the parent
@@ -474,11 +481,14 @@ extension SSHChildChannel: Channel, ChannelCore {
             self.initializer = nil
             return initializer?(self, channelType) ?? self.eventLoop.makeSucceededFuture(())
         }.map {
-            self.initializerComplete(userPromise: userPromise)
+            self.initializerComplete()
         }
 
         f.whenFailure { (error: Error) in
+            let initializing = self.initializingUserActivatePromise
+            self.initializingUserActivatePromise = nil
             if !self.didClose { self.initializerFailed(error: error) }
+            initializing?.fail(error)
         }
     }
 
@@ -506,8 +516,14 @@ extension SSHChildChannel: Channel, ChannelCore {
         }
     }
 
-    private func initializerComplete(userPromise: EventLoopPromise<Channel>?) {
-        guard !self.didClose else { return }
+    private func initializerComplete() {
+        let userPromise = self.initializingUserActivatePromise
+        self.initializingUserActivatePromise = nil
+        guard !self.didClose else {
+            self.closeFuture.cascadeFailure(to: userPromise)
+            return
+        }
+        self.userActivatePromise = userPromise
         // We need to work out what we need to do once the initializer completes.
 
         if self.state.isActiveOnNetwork {

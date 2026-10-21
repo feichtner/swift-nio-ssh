@@ -2341,6 +2341,9 @@ extension ChildChannelMultiplexerTests {
             let (child, id) = try self.activeAbortTestChild(h, peerID: 20)
             if peerFirst {
                 try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+                // Match the real parent read cycle: flush the queued ACK
+                // before the deferred handler-removal tick.
+                h.multiplexer.parentChannelReadComplete()
                 h.eventLoop.run()
                 let original = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
                 let repeatedEvent = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
@@ -2390,6 +2393,22 @@ extension ChildChannelMultiplexerTests {
             XCTAssertFalse(child.isActive)
             XCTAssertTrue(h.delegate._channel.isActive)
         }
+    }
+
+    func testTCPShutdownWhileInitializingPreservesOriginalInitializerFailure() throws {
+        let h = self.harnessForbiddingInboundChannels()
+        defer { h.finish() }
+        let gate = h.eventLoop.makePromise(of: Void.self)
+        let activated = h.eventLoop.makePromise(of: Channel.self)
+        let activation = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        activated.futureResult.whenFailure { activation.value = $0 }
+        h.multiplexer.createChildChannel(activated, channelType: .session) { _, _ in gate.futureResult }
+        h.multiplexer.parentChannelInactive()
+        h.eventLoop.run()
+        XCTAssertNil(activation.value)
+        gate.fail(MultiplexerTestError.rejected)
+        XCTAssertEqual(activation.value as? MultiplexerTestError, .rejected)
+        XCTAssertTrue(h.flushedMessages.isEmpty)
     }
 
     func testAbortReentrantFromActivationDoesNotPublishBufferedRequest() throws {
