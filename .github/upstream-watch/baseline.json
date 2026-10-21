@@ -1,0 +1,89 @@
+{
+  "advisories": {
+    "GHSA-998x-vgvp-xwpc": "2026-07-17T17:05:34Z"
+  },
+  "main": "149f32ffacda5770e513cb41bd175e3d6ef77ce3",
+  "pulls": {
+    "125": {
+      "head": "d69936dca1e154ba53f5599efb145dbf4ba43bee",
+      "title": "Updated Jim Studt's PR to support servers seeing user's usernames"
+    },
+    "158": {
+      "head": "fa483b5937eb5e7fcb9aecfaa66922f832d3c8f0",
+      "title": "Separate public/private keys and signatures into protocol conformances"
+    },
+    "219": {
+      "head": "96d8ebc153218291f0d5257aabaeb71ce961afc6",
+      "title": "Add RSA key support (ssh-rsa, rsa-sha2-256, rsa-sha2-512)"
+    },
+    "220": {
+      "head": "43538bd4b434d3b38eae1bcf243678f69ea9e9c7",
+      "title": "feat: support for external signers in NIOSSHPrivateKey"
+    },
+    "222": {
+      "head": "3a6193cbbf15b2118c2ff05161fafe99b792016d",
+      "title": "Fix parser corruption on unknown channel request types"
+    },
+    "224": {
+      "head": "d1532939ddc1ef4f704290d081952fe38da0c0ec",
+      "title": "Return .ignore() for unknown message types per RFC 4253"
+    },
+    "226": {
+      "head": "18a194f253f63ac6a797d2ba7c54b2a1b2faa179",
+      "title": "Advertise OpenSSH certificate support in host key algorithms"
+    },
+    "230": {
+      "head": "8ad5a6c0654901c5f06236cd10c7d9dfa49a45a0",
+      "title": "Add ssh-agent support"
+    },
+    "235": {
+      "head": "0b71be7650904a77c1e98a82767e1406a90f62e6",
+      "title": "Add mlkem768x25519-sha256 post-quantum hybrid KEX"
+    },
+    "236": {
+      "head": "b1feaef10479b8761ac055af79793d8983f54bc3",
+      "title": "Allow AEAD ciphers to ignore compatibility MAC negotiation"
+    },
+    "239": {
+      "head": "aea3dff812727e71bf0d71bd876edfbd73cdd657",
+      "title": "Don't crash on window adjust for a closed child channel"
+    },
+    "240": {
+      "head": "d87459cd5195ce9093da5b6c3121e896b32097a0",
+      "title": "add agent forwarding support"
+    },
+    "242": {
+      "head": "cbd74855d1227f96f5d00f533cf4a7bd967479ef",
+      "title": "Add client-side keyboard-interactive authentication (RFC 4256)"
+    },
+    "252": {
+      "head": "e2daad6b10ca87d5e8f76368c10511a3fb946dc5",
+      "title": "Forward the parent channel's writability to child channels"
+    },
+    "253": {
+      "head": "17e73fd0b47d85c615285d773676f88bdddfebca",
+      "title": "Buffer child channel writes during a rekey instead of rejecting them"
+    },
+    "254": {
+      "head": "af1900356f5a8a82eb47a89e90ec0c093ec3bba8",
+      "title": "Expose sendGlobalRequest(name:wantReply:data:promise:)"
+    },
+    "255": {
+      "head": "f2d09ffe3db75898809a200abfd4794c6ed45594",
+      "title": "Allow Windows in CSPRNG, where SystemRandomNumberGenerator uses BCryptGenRandom"
+    },
+    "257": {
+      "head": "ed416085cc7e1b61069235f172bed4b4b4a28efe",
+      "title": "Re-issue a WINDOW_ADJUST refused during key exchange"
+    },
+    "49": {
+      "head": "10aa6efcbeaf863fdf0a25dbed05e8fd38068b78",
+      "title": "Set a maximum packet size of 32768 bytes for version and cleartext packets"
+    },
+    "58": {
+      "head": "a1b1d9588b1c13010112b601b76a799a575d533a",
+      "title": "Add a ChannelOption for a server to query the authenticated username."
+    }
+  },
+  "release": "0.15.0"
+}

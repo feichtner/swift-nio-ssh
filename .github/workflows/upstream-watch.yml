@@ -1,0 +1,69 @@
+# FeTerm: watch apple/swift-nio-ssh for what this fork has not reviewed yet.
+#
+# FeTerm pins this fork by revision, so Dependabot never proposes a bump, and
+# GitHub's advisory matching keys on apple/swift-nio-ssh, not on the fork. This
+# job fills that gap. It lives on main only because GitHub runs scheduled
+# workflows from the default branch. It is one new directory, so syncing main
+# with upstream stays a clean merge.
+#
+#   watch:       diff upstream (main, release, advisories, open source PRs)
+#                against .github/upstream-watch/baseline.json. It fails, and
+#                so notifies the owner, when anything is new.
+#   merge-check: when upstream main moved, merge it into feterm-patches in a
+#                scratch checkout and run the full suite. That answers "would
+#                taking upstream break our patches?" before anyone tries it.
+#
+# Read-only: it never pushes, comments or opens anything.
+name: upstream-watch
+
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    outputs:
+      main_moved: ${{ steps.diff.outputs.main_moved }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - id: diff
+        name: Compare upstream with the reviewed baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/upstream-watch/watch.py .github/upstream-watch/baseline.json
+
+  merge-check:
+    needs: watch
+    if: ${{ always() && needs.watch.outputs.main_moved == 'true' }}
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: "*"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: feterm-patches
+          fetch-depth: 0
+      - name: Merge upstream main into the patch branch (scratch only)
+        run: |
+          git config user.name upstream-watch
+          git config user.email upstream-watch@invalid
+          git fetch --no-tags https://github.com/apple/swift-nio-ssh.git main
+          if ! git merge --no-edit FETCH_HEAD; then
+            echo "::error::upstream main no longer merges cleanly into feterm-patches"
+            git diff --name-only --diff-filter=U
+            exit 1
+          fi
+      - name: Test the merged tree
+        run: swift test
