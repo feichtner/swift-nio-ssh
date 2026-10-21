@@ -148,7 +148,8 @@ enum MLKEM768: HybridKEMProvider {
     /// Single use is the caller's job — it drops its reference before
     /// decapsulating.
     static func decapsulate(
-        _ ciphertext: [UInt8], with secretKey: inout Crypto.MLKEM768.PrivateKey
+        _ ciphertext: [UInt8],
+        with secretKey: inout Crypto.MLKEM768.PrivateKey
     ) throws -> [UInt8] {
         let shared = try secretKey.decapsulate(Data(ciphertext))
         return shared.withUnsafeBytes { Array($0) }
@@ -392,8 +393,12 @@ struct HybridKEMX25519KeyExchange<KEM: HybridKEMProvider>: EllipticCurveKeyExcha
             return NIOSSHSessionKeys(
                 initialInboundIV: deriveKey(UInt8(ascii: "B"), expectedKeySizes.ivSize),
                 initialOutboundIV: deriveKey(UInt8(ascii: "A"), expectedKeySizes.ivSize),
-                inboundEncryptionKey: SymmetricKey(data: deriveKey(UInt8(ascii: "D"), expectedKeySizes.encryptionKeySize)),
-                outboundEncryptionKey: SymmetricKey(data: deriveKey(UInt8(ascii: "C"), expectedKeySizes.encryptionKeySize)),
+                inboundEncryptionKey: SymmetricKey(
+                    data: deriveKey(UInt8(ascii: "D"), expectedKeySizes.encryptionKeySize)
+                ),
+                outboundEncryptionKey: SymmetricKey(
+                    data: deriveKey(UInt8(ascii: "C"), expectedKeySizes.encryptionKeySize)
+                ),
                 inboundMACKey: SymmetricKey(data: deriveKey(UInt8(ascii: "F"), expectedKeySizes.macKeySize)),
                 outboundMACKey: SymmetricKey(data: deriveKey(UInt8(ascii: "E"), expectedKeySizes.macKeySize))
             )
@@ -401,8 +406,12 @@ struct HybridKEMX25519KeyExchange<KEM: HybridKEMProvider>: EllipticCurveKeyExcha
             return NIOSSHSessionKeys(
                 initialInboundIV: deriveKey(UInt8(ascii: "A"), expectedKeySizes.ivSize),
                 initialOutboundIV: deriveKey(UInt8(ascii: "B"), expectedKeySizes.ivSize),
-                inboundEncryptionKey: SymmetricKey(data: deriveKey(UInt8(ascii: "C"), expectedKeySizes.encryptionKeySize)),
-                outboundEncryptionKey: SymmetricKey(data: deriveKey(UInt8(ascii: "D"), expectedKeySizes.encryptionKeySize)),
+                inboundEncryptionKey: SymmetricKey(
+                    data: deriveKey(UInt8(ascii: "C"), expectedKeySizes.encryptionKeySize)
+                ),
+                outboundEncryptionKey: SymmetricKey(
+                    data: deriveKey(UInt8(ascii: "D"), expectedKeySizes.encryptionKeySize)
+                ),
                 inboundMACKey: SymmetricKey(data: deriveKey(UInt8(ascii: "E"), expectedKeySizes.macKeySize)),
                 outboundMACKey: SymmetricKey(data: deriveKey(UInt8(ascii: "F"), expectedKeySizes.macKeySize))
             )

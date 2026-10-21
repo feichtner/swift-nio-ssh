@@ -81,7 +81,7 @@ no new parse surface. **Sound.**
 | Finding | Severity | Status |
 | --- | --- | --- |
 | `feterm-patches` had no branch protection: history was force-pushable on a public repo consumed by a real app | Medium | **Fixed** — ruleset `feterm-patches-immutable-history` (no deletion, no force-push) on `feterm-patches` and `main`. Consumers were already revision-pinned via Package.resolved, so builds could not be silently retargeted; the ruleset closes tampering with future updates. |
-| The fork's own 361-test suite ran only on the maintainer's machine — the consuming app's CI compiles these sources but never executes this package's tests | Medium | **Fixed** — `feterm-ci.yml` runs the suite in swift:6.2 on hosted runners for every push/PR to `feterm-patches`, and warns when the vendored `sntrup761.c` drifts from openssh-portable master. |
+| The fork's own 361-test suite ran only on the maintainer's machine — the consuming app's CI compiles these sources but never executes this package's tests | Medium | **Fixed** — `feterm-ci.yml` runs the suite in swift:6.2 on hosted runners for every push/PR to `feterm-patches`, and warns when the vendored `sntrup761.c` drifts from openssh-portable default branch. |
 | SHA-512 shim silently wrong above 2^61 bytes | Low | **Fixed** — contract documented at the declaration; unreachable from sntrup761. |
 | ML-KEM keygen `try!` aborts on entropy failure | Info | By design — identical to the C shim's `abort()`; documented at the call. |
 

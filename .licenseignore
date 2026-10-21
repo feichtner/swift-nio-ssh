@@ -35,3 +35,4 @@ Snippets/*
 dev/alloc-limits-from-test-output
 dev/git.commit.template
 dev/update-alloc-limits-to-last-completed-ci-build
+Sources/CNIOSSHSNTRUP761/sntrup761.c
