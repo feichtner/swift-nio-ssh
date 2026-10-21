@@ -581,6 +581,10 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
     }
 
     func writeTerminalControl(_ message: SSHMessage) throws {
+        try self.writeTerminalControl(message, promise: nil)
+    }
+
+    private func writeTerminalControl(_ message: SSHMessage, promise: EventLoopPromise<Void>?) throws {
         guard let context = self.context else { throw ChannelError.ioOnClosedChannel }
         let completion = context.eventLoop.makePromise(of: Void.self)
         do {
@@ -591,6 +595,7 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
             completion.fail(error)
             throw error
         }
+        completion.futureResult.cascade(to: promise)
         let owner = NIOLoopBound(self, eventLoop: context.eventLoop)
         completion.futureResult.whenFailure { error in owner.value.terminalControlWriteFailed(error) }
     }
@@ -608,7 +613,14 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
         }
 
         do {
-            try self.writeMessage(SSHMultiMessage(message), context: context, promise: promise)
+            switch message {
+            case .channelClose, .channelOpenFailure:
+                // Unreserved responses do not queue, but own the same complete
+                // synchronous/asynchronous failure observation as reserved ones.
+                try self.writeTerminalControl(message, promise: promise)
+            default:
+                try self.writeMessage(SSHMultiMessage(message), context: context, promise: promise)
+            }
         } catch {
             promise?.fail(error)
             switch message {

@@ -19,8 +19,9 @@ import XCTest
 
 @testable import NIOSSH
 
-enum EndToEndTestError: Error {
+enum EndToEndTestError: Error, Equatable {
     case unableToCreateChildChannel
+    case injectedTerminalWriteFailure
 }
 
 class BackToBackEmbeddedChannel {
@@ -978,6 +979,69 @@ extension EndToEndTests {
             XCTAssertTrue(sibling.isActive)
             XCTAssertTrue(pair.client.isActive)
             XCTAssertTrue(pair.server.isActive)
+        }
+    }
+}
+
+private final class DelayedTerminalWriteFailure: ChannelOutboundHandler, Sendable {
+    typealias OutboundIn = Any
+    let writes: NIOLoopBoundBox<Int>
+
+    init(writes: NIOLoopBoundBox<Int>) { self.writes = writes }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        self.writes.value += 1
+        // Actual handler-owned promise, failed AFTER context.write returns.
+        // This is deterministic fault injection, not a real network failure.
+        context.eventLoop.execute { promise?.fail(EndToEndTestError.injectedTerminalWriteFailure) }
+    }
+}
+
+extension EndToEndTests {
+    func testUnreservedTerminalAsyncWriteFailurePreservesCallerAndClosesTransportOnce() throws {
+        for openFailure in [false, true] {
+            for withCaller in [false, true] {
+                let pair = BackToBackEmbeddedChannel()
+                defer { XCTAssertNoThrow(try pair.finish()) }
+                try pair.configureWithHarness(TestHarness())
+                try pair.activate()
+                try pair.interactInMemory()
+                let handler = try XCTUnwrap(pair.clientSSHHandler)
+                let writes = NIOLoopBoundBox(0, eventLoop: pair.client.eventLoop)
+                let outcomes = NIOLoopBoundBox(0, eventLoop: pair.client.eventLoop)
+                let errors = ErrorLoggingHandler()
+                try pair.client.pipeline.syncOperations.addHandler(
+                    DelayedTerminalWriteFailure(writes: writes),
+                    position: .first
+                )
+                try pair.client.pipeline.syncOperations.addHandler(errors)
+                let caller = withCaller ? pair.client.eventLoop.makePromise(of: Void.self) : nil
+                caller?.futureResult.whenFailure { error in
+                    XCTAssertEqual(error as? EndToEndTestError, .injectedTerminalWriteFailure)
+                    outcomes.value += 1
+                }
+                let message: SSHMessage =
+                    openFailure
+                    ? .channelOpenFailure(
+                        .init(recipientChannel: 9, reasonCode: 4, description: "limit", language: "en")
+                    )
+                    : .channelClose(.init(recipientChannel: 9))
+                handler.writeFromChildChannel(message, caller)
+                XCTAssertEqual(writes.value, 1)
+                XCTAssertEqual(outcomes.value, 0)
+                XCTAssertTrue(pair.client.isActive)
+                pair.run()
+                XCTAssertEqual(outcomes.value, withCaller ? 1 : 0)
+                XCTAssertEqual(errors.errors.count, 1)
+                XCTAssertEqual(errors.errors.first as? EndToEndTestError, .injectedTerminalWriteFailure)
+                XCTAssertFalse(pair.client.isActive)
+                XCTAssertThrowsError(try pair.client.throwIfErrorCaught())
+                XCTAssertNoThrow(try pair.client.throwIfErrorCaught())
+                pair.run()
+                XCTAssertEqual(writes.value, 1)
+                XCTAssertEqual(outcomes.value, withCaller ? 1 : 0)
+                XCTAssertEqual(errors.errors.count, 1)
+            }
         }
     }
 }
