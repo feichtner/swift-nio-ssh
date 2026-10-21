@@ -176,7 +176,7 @@ extension SSHChannelMultiplexer {
         }
     }
 
-    func childChannelErrored(channelID: UInt32, quarantine: Quarantine?, terminalControlAlreadySent: Bool) {
+    func childChannelErrored(channelID: UInt32, quarantine: Quarantine?) {
         self.channels.removeValue(forKey: channelID)
         if self.canCreateNewChannels, let quarantine {
             if var retained = self.erroredChannels[channelID] {
@@ -185,7 +185,9 @@ extension SSHChannelMultiplexer {
             } else {
                 self.erroredChannels[channelID] = TerminalReservation(
                     phase: quarantine,
-                    sent: terminalControlAlreadySent
+                    // Only this multiplexer can prove serialization. A child
+                    // may have set sentClose while CLOSE is still queued.
+                    sent: false
                 )
             }
         }

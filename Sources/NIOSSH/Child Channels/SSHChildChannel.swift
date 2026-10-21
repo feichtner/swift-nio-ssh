@@ -623,7 +623,6 @@ extension SSHChildChannel: Channel, ChannelCore {
         guard !self.didClose else { return }
         self.didClose = true
 
-        let terminalControlAlreadySent = self.state.sentClose
         let rejectingOpen =
             (self.state.isActiveOnNetwork && !self.state.isActiveOnChannel)
             || self.pendingWritesForMultiplexer.contains {
@@ -661,8 +660,7 @@ extension SSHChildChannel: Channel, ChannelCore {
         // reservation is transferred, never briefly released or counted twice.
         self.multiplexer.childChannelErrored(
             channelID: self.state.localChannelIdentifier,
-            quarantine: quarantine,
-            terminalControlAlreadySent: terminalControlAlreadySent && !rejectingOpen
+            quarantine: quarantine
         )
         self.writePendingToMultiplexer()
 

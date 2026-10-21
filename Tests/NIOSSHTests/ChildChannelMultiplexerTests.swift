@@ -2827,3 +2827,60 @@ extension ChildChannelMultiplexerTests {
         XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
     }
 }
+
+extension ChildChannelMultiplexerTests {
+    func testEOFQueuedCloseSurvivesAbortOrProtocolErrorBeforeParentReadComplete() throws {
+        for protocolError in [false, true] {
+            for rekeying in [false, true] {
+                for peerCloseFirst in [false, true] {
+                    let h = self.harness(maximumReservations: 1)
+                    defer { h.finish() }
+                    let (child, id) = try self.activeAbortTestChild(h, peerID: 81)
+                    try child.setOption(ChannelOptions.allowRemoteHalfClosure, value: false).wait()
+                    h.delegate.canSendChannelControlMessages = !rekeying
+                    let closed = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+                    child.closeFuture.whenFailure { closed.value = $0 }
+                    // EOF sets the child's sentClose, but only queues CLOSE.
+                    // No parent read-completion or outbound flush occurs here.
+                    try h.multiplexer.receiveMessage(self.eof(peerChannelID: id))
+                    XCTAssertEqual(self.closeCount(h, peerID: 81), 0)
+                    if protocolError {
+                        try h.multiplexer.receiveMessage(self.eof(peerChannelID: id))
+                        h.eventLoop.run()
+                    } else {
+                        self.assertAbortTerminal(child, h)
+                    }
+                    XCTAssertEqual(
+                        (closed.value as? NIOSSHError)?.type,
+                        protocolError ? .protocolViolation : .channelAborted
+                    )
+                    XCTAssertFalse(child.isActive)
+                    XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
+                    XCTAssertEqual(self.closeCount(h, peerID: 81), rekeying ? 0 : 1)
+                    if peerCloseFirst {
+                        try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+                        XCTAssertEqual(h.multiplexer.availableChannelReservations, rekeying ? 0 : 1)
+                    }
+                    h.delegate.canSendChannelControlMessages = true
+                    h.multiplexer.drainTerminalControls()
+                    h.multiplexer.parentChannelReadComplete()
+                    h.eventLoop.run()
+                    h.multiplexer.drainTerminalControls()
+                    XCTAssertEqual(self.closeCount(h, peerID: 81), 1)
+                    XCTAssertEqual(h.multiplexer.availableChannelReservations, peerCloseFirst ? 1 : 0)
+                    if !peerCloseFirst { try h.multiplexer.receiveMessage(self.close(peerChannelID: id)) }
+                    XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
+                    // The exact original ID is reusable only after our CLOSE
+                    // was accepted and the peer's CLOSE was accounted for.
+                    h.multiplexer.nextChannelID = id
+                    h.multiplexer.createChildChannel(channelType: .session) { channel, _ in
+                        channel.eventLoop.makeSucceededFuture(())
+                    }
+                    XCTAssertEqual(self.assertChannelOpen(h.flushedMessages.last), id)
+                    XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
+                    XCTAssertTrue(h.delegate._channel.isActive)
+                }
+            }
+        }
+    }
+}
