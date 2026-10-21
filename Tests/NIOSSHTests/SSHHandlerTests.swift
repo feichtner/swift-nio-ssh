@@ -123,3 +123,46 @@ class SSHHandlerTests: XCTestCase {
         XCTAssertFalse(channel.isActive)
     }
 }
+
+extension SSHHandlerTests {
+    func testPreAuthChannelInitializerQueueUsesTheSameReservationCap() throws {
+        let channel = EmbeddedChannel()
+        let handler = NIOSSHHandler(
+            role: .client(
+                .init(
+                    userAuthDelegate: InfinitePasswordDelegate(),
+                    serverAuthDelegate: AcceptAllHostKeysDelegate()
+                )
+            ),
+            allocator: channel.allocator,
+            inboundChildChannelInitializer: nil
+        )
+        try channel.pipeline.syncOperations.addHandler(handler)
+        let completed = NIOLoopBoundBox(0, eventLoop: channel.eventLoop)
+        let initialized = NIOLoopBoundBox(0, eventLoop: channel.eventLoop)
+        for _ in 0..<Constants.maximumChannelReservations {
+            let promise = channel.eventLoop.makePromise(of: Channel.self)
+            promise.futureResult.whenComplete { _ in completed.value += 1 }
+            handler.createChannel(promise) { child, _ in
+                initialized.value += 1
+                return child.eventLoop.makeSucceededFuture(())
+            }
+        }
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, Constants.maximumChannelReservations)
+        let extra = channel.eventLoop.makePromise(of: Channel.self)
+        let refused = NIOLoopBoundBox<Error?>(nil, eventLoop: channel.eventLoop)
+        extra.futureResult.whenFailure { refused.value = $0 }
+        handler.createChannel(extra) { child, _ in
+            initialized.value += 1
+            return child.eventLoop.makeSucceededFuture(())
+        }
+        XCTAssertEqual((refused.value as? NIOSSHError)?.type, .channelResourceLimit)
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, Constants.maximumChannelReservations)
+        XCTAssertEqual(initialized.value, 0)
+        XCTAssertEqual(completed.value, 0)
+        _ = try channel.finish()
+        channel.embeddedEventLoop.run()
+        XCTAssertEqual(completed.value, Constants.maximumChannelReservations)
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, 0)
+    }
+}

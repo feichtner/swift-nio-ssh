@@ -114,6 +114,10 @@ extension NIOSSHError {
         )
     }
 
+    internal static let channelAborted = NIOSSHError(type: .channelAborted, diagnostics: nil)
+
+    internal static let channelResourceLimit = NIOSSHError(type: .channelResourceLimit, diagnostics: nil)
+
     internal static let creatingChannelAfterClosure = NIOSSHError(type: .creatingChannelAfterClosure, diagnostics: nil)
 
     internal static let tcpShutdown = NIOSSHError(type: .tcpShutdown, diagnostics: nil)
@@ -195,6 +199,8 @@ extension NIOSSHError {
             case unsupportedVersion
             case channelSetupRejected
             case flowControlViolation
+            case channelAborted
+            case channelResourceLimit
             case creatingChannelAfterClosure
             case tcpShutdown
             case invalidUserAuthSignature
@@ -268,6 +274,12 @@ extension NIOSSHError {
 
         /// The remote peer violated the SSH flow control rules.
         public static let flowControlViolation: ErrorType = .init(.flowControlViolation)
+
+        /// A dedicated child was terminated locally without peer acknowledgement.
+        public static let channelAborted: ErrorType = .init(.channelAborted)
+
+        /// This connection has no channel reservation available.
+        public static let channelResourceLimit: ErrorType = .init(.channelResourceLimit)
 
         /// The user attempted to create an SSH channel after the SSH handler was closed.
         public static let creatingChannelAfterClosure: ErrorType = .init(.creatingChannelAfterClosure)

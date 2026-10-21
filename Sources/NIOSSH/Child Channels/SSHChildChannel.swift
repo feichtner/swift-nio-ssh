@@ -282,7 +282,7 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     public func write0(_ data: NIOAny, promise: EventLoopPromise<Void>?) {
-        guard !self.state.isClosed else {
+        guard !self.didClose, !self.state.isClosed else {
             promise?.fail(ChannelError.ioOnClosedChannel)
             return
         }
@@ -304,6 +304,7 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     public func flush0() {
+        guard !self.didClose else { return }
         self.pendingWritesFromChannel.mark()
 
         if self.isActive {
@@ -314,6 +315,7 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     public func read0() {
+        guard !self.didClose else { return }
         if self.unsatisfiedRead {
             // We already have an unsatisfied read, let's do nothing.
             return
@@ -334,6 +336,10 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     public func close0(error: Error, mode: CloseMode, promise: EventLoopPromise<Void>?) {
+        if self.didClose {
+            self.closeFuture.cascade(to: promise)
+            return
+        }
         // Can't process this right now.
         if self.bufferOutboundEvent(.close(error, mode, promise)) {
             return
@@ -385,6 +391,15 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     public func triggerUserOutboundEvent0(_ event: Any, promise: EventLoopPromise<Void>?) {
+        if event is SSHChannelAbortEvent {
+            self.closeFuture.cascade(to: promise)
+            self.errorEncountered(error: NIOSSHError.channelAborted)
+            return
+        }
+        guard !self.didClose else {
+            promise?.fail(ChannelError.ioOnClosedChannel)
+            return
+        }
         if self.bufferOutboundEvent(.userOutboundEvent(event, promise)) {
             // Buffered, nothing to do here.
             return
@@ -442,6 +457,9 @@ extension SSHChildChannel: Channel, ChannelCore {
 
     internal func configure(userPromise: EventLoopPromise<Channel>?, channelType: SSHChannelType) {
         self.type = channelType
+        // Retain the caller's activation promise before any initializer can
+        // suspend, so abort never waits on application initialization.
+        self.userActivatePromise = userPromise
 
         // We need to configure this channel. This involves doing four things:
         // 1. Setting our autoRead state from the parent
@@ -458,8 +476,7 @@ extension SSHChildChannel: Channel, ChannelCore {
         }
 
         f.whenFailure { (error: Error) in
-            self.initializerFailed(error: error)
-            userPromise?.fail(error)
+            if !self.didClose { self.initializerFailed(error: error) }
         }
     }
 
@@ -467,7 +484,7 @@ extension SSHChildChannel: Channel, ChannelCore {
     fileprivate func performActivation() {
         // We validate that the parent is active, and that we're active on the network, and that we haven't
         // activated already before we proceed. This makes this method idempotent.
-        guard let parent = self.parent, parent.isActive, self.state.isActiveOnNetwork,
+        guard !self.didClose, let parent = self.parent, parent.isActive, self.state.isActiveOnNetwork,
             case .neverActivated = self.activationState
         else {
             return
@@ -488,8 +505,8 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     private func initializerComplete(userPromise: EventLoopPromise<Channel>?) {
+        guard !self.didClose else { return }
         // We need to work out what we need to do once the initializer completes.
-        self.userActivatePromise = userPromise
 
         if self.state.isActiveOnNetwork {
             // We need to send a channelOpenSuccess.
@@ -585,17 +602,42 @@ extension SSHChildChannel: Channel, ChannelCore {
     }
 
     fileprivate func errorEncountered(error: Error) {
-        // We use didClose as a gating mechanism: only one of closedCleanly
-        // or errorEncountered ever gets to run. This is important, as errorEncountered
-        // can actually trigger closedCleanly.
-        if self.didClose {
-            return
-        }
+        guard !self.didClose else { return }
         self.didClose = true
+
+        // Decide the wire transition before making outcalls. An unconfirmed
+        // local OPEN has no peer ID; a remote OPEN must be rejected, not CLOSEd.
+        if self.state.isActiveOnNetwork, let peerID = self.state.remoteChannelIdentifier {
+            if !self.state.isActiveOnChannel {
+                self.processOutboundMessage(
+                    .channelOpenFailure(
+                        .init(
+                            recipientChannel: peerID,
+                            reasonCode: 2,
+                            description: "",
+                            language: "en-US"
+                        )
+                    ),
+                    promise: nil
+                )
+            } else if !self.state.sentClose {
+                self.processOutboundMessage(.channelClose(.init(recipientChannel: peerID)), promise: nil)
+            }
+        }
+        let quarantine: SSHChannelMultiplexer.Quarantine?
+        if self.state.isActiveOnNetwork {
+            quarantine = self.state.remoteChannelIdentifier == nil ? .awaitingOpenResponse : .awaitingClose
+        } else {
+            quarantine = nil
+        }
+        // Detach BEFORE outbound/inactive/future callbacks can reenter. The
+        // reservation is transferred, never briefly released or counted twice.
+        self.multiplexer.childChannelErrored(channelID: self.state.localChannelIdentifier, quarantine: quarantine)
+        self.writePendingToMultiplexer()
 
         self.deliverPendingReads()
         self.failPendingWrites(error: error)
-        self.failPendingOutboundEvents(error: error)  // These all go away, but we're going to use our own!
+        self.failPendingOutboundEvents(error: error)
         if let promise = self.pendingClosePromise {
             self.pendingClosePromise = nil
             promise.fail(error)
@@ -606,21 +648,9 @@ extension SSHChildChannel: Channel, ChannelCore {
         }
         self.pipeline.fireErrorCaught(error)
         self.notifyChannelInactive()
-
-        // Ok, we need to notify the network that we're done.
-        if self.state.isActiveOnNetwork, !self.state.sentClose {
-            let message = SSHMessage.ChannelCloseMessage(recipientChannel: self.state.remoteChannelIdentifier!)
-            self.processOutboundMessage(.channelClose(message), promise: nil)
-            self.writePendingToMultiplexer()
-        }
-
         self.eventLoop.execute {
             self.removeHandlers(pipeline: self.pipeline)
             self.closePromise.fail(error)
-            self.multiplexer.childChannelErrored(
-                channelID: self.state.localChannelIdentifier,
-                expectClose: !self.state.isClosed
-            )
         }
     }
 

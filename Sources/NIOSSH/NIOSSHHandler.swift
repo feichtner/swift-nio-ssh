@@ -291,6 +291,14 @@ extension NIOSSHHandler {
         channelType: SSHChannelType = .session,
         _ channelInitializer: ((Channel, SSHChannelType) -> EventLoopFuture<Void>)?
     ) {
+        guard let multiplexer = self.multiplexer else {
+            promise?.fail(NIOSSHError.creatingChannelAfterClosure)
+            return
+        }
+        guard multiplexer.canReserveChannel else {
+            promise?.fail(NIOSSHError.channelResourceLimit)
+            return
+        }
         self.pendingChannelInitializations.append(
             (promise: promise, channelType: channelType, initializer: channelInitializer)
         )
@@ -569,4 +577,8 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
             self.context?.flush()
         }
     }
+}
+
+extension NIOSSHHandler {
+    var pendingChannelInitializationsCount: Int { self.pendingChannelInitializations.count }
 }

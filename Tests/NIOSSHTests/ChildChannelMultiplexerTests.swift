@@ -23,6 +23,8 @@ import XCTest
 /// This reduces the testing surface area somewhat, which greatly helps us to test the
 /// implementation of the multiplexer and child channels.
 final class DummyDelegate: SSHMultiplexerDelegate {
+    var pendingChannelInitializationsCount = 0
+
     var _channel: EmbeddedChannel = EmbeddedChannel()
 
     var writes: MarkedCircularBuffer<(SSHMessage, EventLoopPromise<Void>?)> = MarkedCircularBuffer(initialCapacity: 8)
@@ -148,6 +150,14 @@ final class EOFRecorder: ChannelInboundHandler {
     }
 }
 
+private final class AbortOnActivationHandler: ChannelInboundHandler {
+    typealias InboundIn = Any
+
+    func channelActive(context: ChannelHandlerContext) {
+        context.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+    }
+}
+
 private enum MultiplexerTestError: Error {
     case rejected
 }
@@ -182,13 +192,17 @@ final class ChildChannelMultiplexerTests: XCTestCase {
         }
     }
 
-    private func harness(_ initializer: SSHChildChannel.Initializer? = nil) -> TestHarness {
+    private func harness(
+        maximumReservations: Int = Constants.maximumChannelReservations,
+        _ initializer: SSHChildChannel.Initializer? = nil
+    ) -> TestHarness {
         let delegate = DummyDelegate()
         let multiplexer = SSHChannelMultiplexer(
             delegate: delegate,
             allocator: delegate.allocator,
             childChannelInitializer: initializer,
-            maximumPacketSize: UInt32(Constants.defaultMaximumChannelPacketSize)
+            maximumPacketSize: UInt32(Constants.defaultMaximumChannelPacketSize),
+            maximumReservations: maximumReservations
         )
         return TestHarness(delegate: delegate, multiplexer: multiplexer)
     }
@@ -2191,4 +2205,359 @@ extension ByteBuffer {
         // We store it in a static so that we don't have to re-create it for every test.
         return ByteBuffer(repeating: 0, count: size + 1)
     }()
+}
+
+extension ChildChannelMultiplexerTests {
+    private func activeAbortTestChild(
+        _ h: TestHarness,
+        peerID: UInt32,
+        window: UInt32 = 1 << 24
+    ) throws -> (Channel, UInt32) {
+        var child: Channel?
+        h.multiplexer.createChildChannel(channelType: .session) { channel, _ in
+            child = channel
+            return channel.eventLoop.makeSucceededFuture(())
+        }
+        let channel = try XCTUnwrap(child)
+        let id = try XCTUnwrap(self.assertChannelOpen(h.flushedMessages.last))
+        try h.multiplexer.receiveMessage(
+            self.openConfirmation(
+                originalChannelID: id,
+                peerChannelID: peerID,
+                initialWindowSize: window
+            )
+        )
+        XCTAssertTrue(channel.isActive)
+        return (channel, id)
+    }
+
+    private func assertAbortTerminal(_ channel: Channel, _ h: TestHarness) {
+        let result = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
+        channel.triggerUserOutboundEvent(SSHChannelAbortEvent()).whenComplete { result.value = $0 }
+        h.eventLoop.run()
+        // Never wait() on an unresolved future: a regressed abort must fail
+        // this assertion finitely, not strand the entire test runner.
+        XCTAssertNotNil(result.value)
+        if case .failure(let error)? = result.value {
+            XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+        } else {
+            XCTFail("Abort must report local termination")
+        }
+        XCTAssertFalse(channel.isActive)
+    }
+
+    private func closeCount(_ h: TestHarness, peerID: UInt32) -> Int {
+        h.flushedMessages.filter {
+            if case .channelClose(let m) = $0 { return m.recipientChannel == peerID }
+            return false
+        }.count
+    }
+
+    func testAbortTerminatesWithoutPeerCloseAndPreservesSibling() throws {
+        let h = self.harnessForbiddingInboundChannels()
+        defer { h.finish() }
+        let (child, id) = try self.activeAbortTestChild(h, peerID: 10, window: 0)
+        let (sibling, siblingID) = try self.activeAbortTestChild(h, peerID: 11)
+        let recorder = NIOLoopBound(ReadRecordingHandler(), eventLoop: h.eventLoop)
+        try sibling.pipeline.syncOperations.addHandler(recorder.value)
+        let inactive = ChannelInactiveRecorder()
+        try child.pipeline.syncOperations.addHandler(inactive)
+        let write = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
+        child.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(string: "held"))))
+            .whenComplete { write.value = $0 }
+        XCTAssertNil(write.value)
+        self.assertAbortTerminal(child, h)
+        XCTAssertTrue(inactive.seenInactive)
+        XCTAssertThrowsError(try child.pipeline.syncOperations.handler(type: ChannelInactiveRecorder.self))
+        if case .failure(let error)? = write.value {
+            XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+        } else {
+            XCTFail("Pending write escaped local abort")
+        }
+        XCTAssertEqual(self.closeCount(h, peerID: 10), 1)
+        let bytes = ByteBuffer(string: "late")
+        for message in [
+            self.data(peerChannelID: id, data: bytes), self.eof(peerChannelID: id),
+            self.windowAdjust(peerChannelID: id, increment: 1),
+            .channelRequest(.init(recipientChannel: id, type: .exec("late"), wantReply: true)),
+            .channelSuccess(.init(recipientChannel: id)), .channelFailure(.init(recipientChannel: id)),
+        ] {
+            XCTAssertNoThrow(try h.multiplexer.receiveMessage(message))
+        }
+        XCTAssertNoThrow(
+            try h.multiplexer.receiveMessage(
+                .channelExtendedData(
+                    .init(
+                        recipientChannel: id,
+                        dataTypeCode: .stderr,
+                        data: bytes
+                    )
+                )
+            )
+        )
+        try h.multiplexer.receiveMessage(self.data(peerChannelID: siblingID, data: bytes))
+        XCTAssertEqual(recorder.value.reads, [.init(type: .channel, data: .byteBuffer(bytes))])
+        sibling.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(bytes)), promise: nil)
+        XCTAssertTrue(sibling.isActive)
+        XCTAssertTrue(h.delegate._channel.isActive)
+        self.assertAbortTerminal(child, h)
+        XCTAssertEqual(self.closeCount(h, peerID: 10), 1)
+        let available = h.multiplexer.availableChannelReservations
+        try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+        XCTAssertEqual(h.multiplexer.availableChannelReservations, available + 1)
+    }
+
+    func testAbortAfterOrdinaryCloseDoesNotSendDuplicateClose() throws {
+        for peerFirst in [false, true] {
+            let h = self.harnessForbiddingInboundChannels()
+            defer { h.finish() }
+            let (child, id) = try self.activeAbortTestChild(h, peerID: 20)
+            if peerFirst {
+                try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+                h.eventLoop.run()
+                let result = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: h.eventLoop)
+                child.triggerUserOutboundEvent(SSHChannelAbortEvent()).whenComplete { result.value = $0 }
+                h.eventLoop.run()
+                guard case .success? = result.value else { return XCTFail("Clean terminal result changed") }
+            } else {
+                let close = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+                child.close().whenFailure { close.value = $0 }
+                XCTAssertNil(close.value)
+                self.assertAbortTerminal(child, h)
+                XCTAssertEqual((close.value as? NIOSSHError)?.type, .channelAborted)
+                try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+            }
+            XCTAssertEqual(self.closeCount(h, peerID: 20), 1)
+            XCTAssertTrue(h.delegate._channel.isActive)
+        }
+    }
+
+    func testAbortBeforeInitializerCompletesRejectsLateActivationAndBufferedEvents() throws {
+        for failInitializer in [false, true] {
+            let h = self.harnessForbiddingInboundChannels()
+            defer { h.finish() }
+            let gate = h.eventLoop.makePromise(of: Void.self)
+            let activated = h.eventLoop.makePromise(of: Channel.self)
+            let activation = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+            activated.futureResult.whenFailure { activation.value = $0 }
+            var captured: Channel?
+            h.multiplexer.createChildChannel(activated, channelType: .session) { channel, _ in
+                captured = channel
+                return gate.futureResult
+            }
+            let child = try XCTUnwrap(captured)
+            let event = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+            child.triggerUserOutboundEvent(SSHChannelRequestEvent.ExecRequest(command: "never", wantReply: true))
+                .whenFailure { event.value = $0 }
+            XCTAssertNil(event.value)
+            self.assertAbortTerminal(child, h)
+            XCTAssertEqual((activation.value as? NIOSSHError)?.type, .channelAborted)
+            XCTAssertEqual((event.value as? NIOSSHError)?.type, .channelAborted)
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, Constants.maximumChannelReservations)
+            if failInitializer { gate.fail(MultiplexerTestError.rejected) } else { gate.succeed(()) }
+            h.eventLoop.run()
+            XCTAssertTrue(h.flushedMessages.isEmpty)
+            XCTAssertFalse(child.isActive)
+            XCTAssertTrue(h.delegate._channel.isActive)
+        }
+    }
+
+    func testAbortReentrantFromActivationDoesNotPublishBufferedRequest() throws {
+        let h = self.harnessForbiddingInboundChannels()
+        defer { h.finish() }
+        var captured: Channel?
+        let activated = h.eventLoop.makePromise(of: Channel.self)
+        let failure = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        activated.futureResult.whenFailure { failure.value = $0 }
+        h.multiplexer.createChildChannel(activated, channelType: .session) { child, _ in
+            captured = child
+            return child.pipeline.addHandler(AbortOnActivationHandler())
+        }
+        let child = try XCTUnwrap(captured)
+        let id = try XCTUnwrap(self.assertChannelOpen(h.flushedMessages.last))
+        child.triggerUserOutboundEvent(
+            SSHChannelRequestEvent.ExecRequest(command: "never", wantReply: true),
+            promise: nil
+        )
+        try h.multiplexer.receiveMessage(self.openConfirmation(originalChannelID: id, peerChannelID: 25))
+        h.eventLoop.run()
+        XCTAssertEqual((failure.value as? NIOSSHError)?.type, .channelAborted)
+        XCTAssertFalse(child.isActive)
+        XCTAssertEqual(self.closeCount(h, peerID: 25), 1)
+        XCTAssertFalse(
+            h.flushedMessages.contains {
+                if case .channelRequest = $0 { return true }
+                return false
+            }
+        )
+        XCTAssertTrue(h.delegate._channel.isActive)
+    }
+
+    func testAbortUnconfirmedOpenHandlesLateConfirmationOrFailureWithoutActivation() throws {
+        for accepted in [false, true] {
+            let h = self.harness(maximumReservations: 1)
+            defer { h.finish() }
+            var captured: Channel?
+            h.multiplexer.createChildChannel(channelType: .session) { channel, _ in
+                captured = channel
+                return channel.eventLoop.makeSucceededFuture(())
+            }
+            let child = try XCTUnwrap(captured)
+            let id = try XCTUnwrap(self.assertChannelOpen(h.flushedMessages.last))
+            self.assertAbortTerminal(child, h)
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
+            XCTAssertEqual(h.flushedMessages.count, 1)
+            if accepted {
+                try h.multiplexer.receiveMessage(self.openConfirmation(originalChannelID: id, peerChannelID: 30))
+                XCTAssertEqual(self.closeCount(h, peerID: 30), 1)
+                // Repeated/late confirmation cannot reactivate or emit another CLOSE.
+                try h.multiplexer.receiveMessage(self.openConfirmation(originalChannelID: id, peerChannelID: 30))
+                XCTAssertEqual(self.closeCount(h, peerID: 30), 1)
+                XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
+                try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+            } else {
+                try h.multiplexer.receiveMessage(self.openFailure(originalChannelID: id, reasonCode: 2))
+            }
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, 1)
+            XCTAssertFalse(child.isActive)
+            XCTAssertTrue(h.delegate._channel.isActive)
+        }
+    }
+
+    func testAbortPendingRemoteOpenRejectsItWithoutCloseOrLateConfirmation() throws {
+        for failInitializer in [false, true] {
+            var gate: EventLoopPromise<Void>?
+            var captured: Channel?
+            let h = self.harness { channel, _ in
+                captured = channel
+                let pending = channel.eventLoop.makePromise(of: Void.self)
+                gate = pending
+                return pending.futureResult
+            }
+            defer { h.finish() }
+            try h.multiplexer.receiveMessage(self.openRequest(channelID: 40))
+            let child = try XCTUnwrap(captured)
+            self.assertAbortTerminal(child, h)
+            XCTAssertEqual(h.flushedMessages.count, 1)
+            if case .channelOpenFailure(let response)? = h.flushedMessages.first {
+                XCTAssertEqual(response.recipientChannel, 40)
+            } else {
+                XCTFail("Remote OPEN must get OPEN_FAILURE, not CLOSE")
+            }
+            let pending = try XCTUnwrap(gate)
+            if failInitializer { pending.fail(MultiplexerTestError.rejected) } else { pending.succeed(()) }
+            h.eventLoop.run()
+            XCTAssertEqual(h.flushedMessages.count, 1)
+            XCTAssertEqual(h.multiplexer.availableChannelReservations, Constants.maximumChannelReservations)
+        }
+    }
+
+    func testAbortLocallyRemotelyAndFullyHalfClosedChannels() throws {
+        for phase in 0..<3 {
+            let h = self.harnessForbiddingInboundChannels()
+            defer { h.finish() }
+            let (child, id) = try self.activeAbortTestChild(h, peerID: 45)
+            try child.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).wait()
+            if phase != 1 { try child.close(mode: .output).wait() }
+            if phase != 0 { try h.multiplexer.receiveMessage(self.eof(peerChannelID: id)) }
+            XCTAssertTrue(child.isActive)
+            self.assertAbortTerminal(child, h)
+            XCTAssertEqual(self.closeCount(h, peerID: 45), 1)
+            XCTAssertTrue(h.delegate._channel.isActive)
+        }
+    }
+
+    func testReservationCapIncludesLiveQuarantineAndQueuedAndRejectsInboundOpen() throws {
+        let h = self.harness(maximumReservations: 2)
+        defer { h.finish() }
+        let (live, _) = try self.activeAbortTestChild(h, peerID: 50)
+        let (aborted, id) = try self.activeAbortTestChild(h, peerID: 51)
+        self.assertAbortTerminal(aborted, h)
+        let position = h.multiplexer.nextChannelID
+        let failed = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+        let promise = h.eventLoop.makePromise(of: Channel.self)
+        promise.futureResult.whenFailure { failed.value = $0 }
+        h.multiplexer.createChildChannel(promise, channelType: .session) { channel, _ in
+            XCTFail("Capacity refusal must precede initializer")
+            return channel.eventLoop.makeSucceededFuture(())
+        }
+        XCTAssertEqual((failed.value as? NIOSSHError)?.type, .channelResourceLimit)
+        XCTAssertEqual(h.multiplexer.nextChannelID, position)
+        try h.multiplexer.receiveMessage(self.openRequest(channelID: 99))
+        if case .channelOpenFailure(let response)? = h.flushedMessages.last {
+            XCTAssertEqual(response.recipientChannel, 99)
+            XCTAssertEqual(response.reasonCode, 4)
+        } else {
+            XCTFail("Saturation must reject peer OPEN without closing parent")
+        }
+        try h.multiplexer.receiveMessage(self.close(peerChannelID: id))
+        h.delegate.pendingChannelInitializationsCount = 1
+        XCTAssertFalse(h.multiplexer.canReserveChannel)
+        h.delegate.pendingChannelInitializationsCount = 0
+        XCTAssertTrue(h.multiplexer.canReserveChannel)
+        _ = try self.activeAbortTestChild(h, peerID: 52)
+        XCTAssertTrue(live.isActive)
+        XCTAssertTrue(h.delegate._channel.isActive)
+    }
+
+    func testRepeatedAbortAdmissionDoesNotGrowPermanentQuarantine() throws {
+        let h = self.harness(maximumReservations: 2)
+        defer { h.finish() }
+        for peer in UInt32(0)..<8 {
+            if peer < 2 {
+                let (child, _) = try self.activeAbortTestChild(h, peerID: peer)
+                self.assertAbortTerminal(child, h)
+            } else {
+                let failure = NIOLoopBoundBox<Error?>(nil, eventLoop: h.eventLoop)
+                let promise = h.eventLoop.makePromise(of: Channel.self)
+                promise.futureResult.whenFailure { failure.value = $0 }
+                h.multiplexer.createChildChannel(promise, channelType: .session) { channel, _ in
+                    XCTFail("Permanent quarantine must exert backpressure")
+                    return channel.eventLoop.makeSucceededFuture(())
+                }
+                XCTAssertEqual((failure.value as? NIOSSHError)?.type, .channelResourceLimit)
+            }
+        }
+        XCTAssertEqual(h.multiplexer.nextChannelID, 2)
+        XCTAssertEqual(h.multiplexer.availableChannelReservations, 0)
+        XCTAssertTrue(h.delegate._channel.isActive)
+    }
+
+    func testAllocatorWrapSkipsLiveAndQuarantinedIDs() throws {
+        let h = self.harness(maximumReservations: 4)
+        defer { h.finish() }
+        let (live, firstID) = try self.activeAbortTestChild(h, peerID: 60)
+        XCTAssertEqual(firstID, 0)
+        h.multiplexer.nextChannelID = UInt32(Int32.max)
+        let (aborted, lastID) = try self.activeAbortTestChild(h, peerID: 61)
+        self.assertAbortTerminal(aborted, h)
+        h.multiplexer.nextChannelID = UInt32(Int32.max)
+        let (_, nextID) = try self.activeAbortTestChild(h, peerID: 62)
+        XCTAssertEqual(lastID, UInt32(Int32.max))
+        XCTAssertEqual(nextID, 1)
+        XCTAssertTrue(live.isActive)
+        try h.multiplexer.receiveMessage(self.close(peerChannelID: lastID))
+        XCTAssertTrue(h.delegate._channel.isActive)
+    }
+
+    func testReentrantAdmissionSeesQuarantineBeforeTerminalCallbacks() throws {
+        for acknowledge in [false, true] {
+            let h = self.harness(maximumReservations: 1)
+            defer { h.finish() }
+            let (child, id) = try self.activeAbortTestChild(h, peerID: 70)
+            let initialized = NIOLoopBoundBox(false, eventLoop: h.eventLoop)
+            let boundHarness = NIOLoopBound(h, eventLoop: h.eventLoop)
+            child.closeFuture.whenComplete { _ in
+                boundHarness.value.multiplexer.createChildChannel(channelType: .session) { next, _ in
+                    initialized.value = true
+                    return next.eventLoop.makeSucceededFuture(())
+                }
+            }
+            child.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+            if acknowledge { try h.multiplexer.receiveMessage(self.close(peerChannelID: id)) }
+            h.eventLoop.run()
+            XCTAssertEqual(initialized.value, acknowledge)
+            XCTAssertTrue(h.delegate._channel.isActive)
+        }
+    }
 }

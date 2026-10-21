@@ -18,14 +18,17 @@ import NIOCore
 final class SSHChannelMultiplexer {
     private var channels: [UInt32: SSHChildChannel]
 
-    private var erroredChannels: [UInt32]
+    enum Quarantine: Equatable { case awaitingOpenResponse, awaitingClose }
+
+    private var erroredChannels: [UInt32: Quarantine]
+    private let maximumReservations: Int
 
     // This object can cause a reference cycle, so we require it to be optional so that we can
     // break the cycle manually.
     private var delegate: SSHMultiplexerDelegate?
 
     /// The next local channel ID to use. We cycle through them monotonically for now.
-    private var nextChannelID: UInt32
+    var nextChannelID: UInt32
 
     private let allocator: ByteBufferAllocator
 
@@ -41,11 +44,14 @@ final class SSHChannelMultiplexer {
         delegate: SSHMultiplexerDelegate,
         allocator: ByteBufferAllocator,
         childChannelInitializer: SSHChildChannel.Initializer?,
-        maximumPacketSize: UInt32
+        maximumPacketSize: UInt32,
+        maximumReservations: Int = Constants.maximumChannelReservations
     ) {
         self.channels = [:]
         self.channels.reserveCapacity(8)
-        self.erroredChannels = []
+        precondition((1...Constants.maximumChannelReservations).contains(maximumReservations))
+        self.maximumReservations = maximumReservations
+        self.erroredChannels = [:]
         self.delegate = delegate
         self.nextChannelID = 0
         self.allocator = allocator
@@ -60,6 +66,7 @@ final class SSHChannelMultiplexer {
         self.delegate = nil
         self.childChannelInitializer = nil
         self.canCreateNewChannels = false
+        self.erroredChannels.removeAll(keepingCapacity: false)
     }
 }
 
@@ -92,26 +99,59 @@ extension SSHChannelMultiplexer {
         self.channels.removeValue(forKey: channelID)
     }
 
-    func childChannelErrored(channelID: UInt32, expectClose: Bool) {
-        // This should never return `nil`, but we don't want to assert on it because
-        // even if the object was never in the map, nothing bad will happen: it's gone!
+    func childChannelErrored(channelID: UInt32, quarantine: Quarantine?) {
         self.channels.removeValue(forKey: channelID)
-
-        if expectClose {
-            // We keep track of the errored channel because we will tolerate receiving a close for it.
-            self.erroredChannels.append(channelID)
-        }
+        if self.canCreateNewChannels, let quarantine { self.erroredChannels[channelID] = quarantine }
     }
+
+    var availableChannelReservations: Int {
+        self.maximumReservations - self.channels.count - self.erroredChannels.count
+    }
+
+    var canReserveChannel: Bool {
+        self.availableChannelReservations > (self.delegate?.pendingChannelInitializationsCount ?? 0)
+    }
+
 }
 
 // MARK: Calls from SSH handlers.
 
 extension SSHChannelMultiplexer {
     func receiveMessage(_ message: SSHMessage) throws {
+        // Quarantine consumes only bounded protocol metadata, never a live
+        // child. A late confirmation must be answered without reactivation.
+        if let localID = message.recipientChannelID, let phase = self.erroredChannels[localID] {
+            switch message {
+            case .channelOpenConfirmation(let reply) where phase == .awaitingOpenResponse:
+                self.erroredChannels[localID] = .awaitingClose
+                self.writeFromChannel(.channelClose(.init(recipientChannel: reply.senderChannel)), nil)
+                self.childChannelFlush()
+            case .channelOpenFailure where phase == .awaitingOpenResponse,
+                .channelClose where phase == .awaitingClose:
+                self.erroredChannels.removeValue(forKey: localID)
+            default: break
+            }
+            return
+        }
         let channel: SSHChildChannel?
 
         switch message {
-        case .channelOpen:
+        case .channelOpen(let request):
+            guard self.canReserveChannel else {
+                self.writeFromChannel(
+                    .channelOpenFailure(
+                        .init(
+                            recipientChannel: request.senderChannel,
+                            reasonCode: 4,
+                            description: "Channel resource limit",
+                            language: "en-US"
+                        )
+                    ),
+                    nil
+                )
+                self.childChannelFlush()
+                return
+            }
             channel = try self.openNewChannel(initializer: self.childChannelInitializer)
 
         case .channelOpenConfirmation(let message):
@@ -125,10 +165,6 @@ extension SSHChannelMultiplexer {
 
         case .channelClose(let message):
             channel = try self.existingChannel(localID: message.recipientChannel)
-            if channel == nil, let errorIndex = self.erroredChannels.firstIndex(of: message.recipientChannel) {
-                // This is the end of our need to keep track of the channel.
-                self.erroredChannels.remove(at: errorIndex)
-            }
 
         case .channelWindowAdjust(let message):
             channel = try self.existingChannel(localID: message.recipientChannel)
@@ -179,7 +215,8 @@ extension SSHChannelMultiplexer {
 
     func parentChannelInactive() {
         self.canCreateNewChannels = false
-        for channel in self.channels.values {
+        self.erroredChannels.removeAll(keepingCapacity: false)
+        for channel in Array(self.channels.values) {
             channel.parentChannelInactive()
         }
     }
@@ -197,14 +234,15 @@ extension SSHChannelMultiplexer {
             throw NIOSSHError.tcpShutdown
         }
 
-        // TODO: We need a better channel ID system. Maybe use indices into Arrays instead?
-        let channelID = self.nextChannelID
-        self.nextChannelID &+= 1
-
-        // Int32.max isn't a spec-defined limit, but it's what OpenSSH uses as its upper bound. We will too.
-        if self.nextChannelID > Int32.max {
-            self.nextChannelID = 0
+        guard self.canReserveChannel else { throw NIOSSHError.channelResourceLimit }
+        // At most reservations+1 candidates are needed, including at wrap.
+        var channelID = self.nextChannelID
+        for _ in 0...self.maximumReservations {
+            channelID = self.nextChannelID
+            self.nextChannelID = channelID == UInt32(Int32.max) ? 0 : channelID + 1
+            if self.channels[channelID] == nil && self.erroredChannels[channelID] == nil { break }
         }
+        precondition(self.channels[channelID] == nil && self.erroredChannels[channelID] == nil)
 
         var (windowsize, overflow) = Int(self.maximumPacketSize).multipliedReportingOverflow(
             by: Constants.channelWindowSizePacketMultiple
@@ -231,7 +269,7 @@ extension SSHChannelMultiplexer {
     private func existingChannel(localID: UInt32) throws -> SSHChildChannel? {
         if let channel = self.channels[localID] {
             return channel
-        } else if self.erroredChannels.contains(localID) {
+        } else if self.erroredChannels[localID] != nil {
             return nil
         } else {
             throw NIOSSHError.protocolViolation(
@@ -246,7 +284,27 @@ extension SSHChannelMultiplexer {
 protocol SSHMultiplexerDelegate {
     var channel: Channel? { get }
 
+    var pendingChannelInitializationsCount: Int { get }
+
     func writeFromChildChannel(_: SSHMessage, _: EventLoopPromise<Void>?)
 
     func flushFromChildChannel()
+}
+
+extension SSHMessage {
+    fileprivate var recipientChannelID: UInt32? {
+        switch self {
+        case .channelOpenConfirmation(let m): return m.recipientChannel
+        case .channelOpenFailure(let m): return m.recipientChannel
+        case .channelEOF(let m): return m.recipientChannel
+        case .channelClose(let m): return m.recipientChannel
+        case .channelWindowAdjust(let m): return m.recipientChannel
+        case .channelData(let m): return m.recipientChannel
+        case .channelExtendedData(let m): return m.recipientChannel
+        case .channelRequest(let m): return m.recipientChannel
+        case .channelSuccess(let m): return m.recipientChannel
+        case .channelFailure(let m): return m.recipientChannel
+        default: return nil
+        }
+    }
 }

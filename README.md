@@ -147,3 +147,21 @@ Global requests are initiated using `NIOSSHHandler.sendGlobalRequest`, and are r
 Servers may be notified of and respond to these requests using a `GlobalRequestDelegate`. The method to implement here is `tcpForwardingRequest(_:handler:promise:)`. This delegate method will be invoked any time a global request is received. The response to the request is passed into `promise`.
 
 Forwarded channels are then sent from server to client using the `.forwardedTCPIP` channel type.
+
+### Dedicated child local abort
+
+Send `SSHChannelAbortEvent()` with `child.triggerUserOutboundEvent` to terminate
+one dedicated child locally without waiting for peer CLOSE. The event promise
+and `child.closeFuture` finish after local handlers are removed, with
+`NIOSSHError.ErrorType.channelAborted`; repeated aborts retain the original
+terminal result. The SSH parent and other children remain available.
+
+Local termination does not acknowledge remote CLOSE, stop a remote process or
+undo an acknowledged write. The connection retains the channel ID until its
+open/close handshake permits release, including a late OPEN confirmation.
+A parent admits at most 256 live, quarantined and queued channel reservations.
+At capacity, new local opens fail with `channelResourceLimit` and inbound opens
+receive resource shortage; existing sessions are not disconnected or evicted.
+A peer that never finishes close can exhaust this admission budget until the
+connection naturally ends. This deliberate backpressure never reuses an ID
+before its protocol release, including at allocator wrap.

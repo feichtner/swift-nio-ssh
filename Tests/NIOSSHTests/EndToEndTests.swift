@@ -851,3 +851,80 @@ class EndToEndTests: XCTestCase {
         }
     }
 }
+
+extension EndToEndTests {
+    func testPublicLocalAbortDoesNotNeedPeerProgressAndSiblingStillTransfers() throws {
+        try self.channel.configureWithHarness(TestHarness())
+        try self.channel.activate()
+        try self.channel.interactInMemory()
+        let first = try self.channel.createNewChannel()
+        try self.channel.interactInMemory()
+        let sibling = try self.channel.createNewChannel()
+        try self.channel.interactInMemory()
+        let remoteSibling = try XCTUnwrap(self.channel.activeServerChannels.last)
+        let reads = NIOLoopBound(ReadRecordingHandler(), eventLoop: remoteSibling.eventLoop)
+        try remoteSibling.pipeline.syncOperations.addHandler(reads.value)
+        let terminal = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: first.eventLoop)
+        first.closeFuture.whenComplete { terminal.value = $0 }
+        first.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        // Drive local cleanup ONLY: the encrypted peer has not received our
+        // CLOSE, so it cannot possibly have sent its acknowledgement yet.
+        self.channel.run()
+        if case .failure(let error)? = terminal.value {
+            XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+        } else {
+            XCTFail("Local abort waited for remote SSH progress")
+        }
+        XCTAssertFalse(first.isActive)
+        XCTAssertTrue(self.channel.client.isActive)
+        XCTAssertTrue(self.channel.server.isActive)
+        XCTAssertTrue(sibling.isActive)
+        let payload = ByteBuffer(string: "sibling survives local abort")
+        sibling.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(payload)), promise: nil)
+        try self.channel.interactInMemory()
+        XCTAssertEqual(reads.value.reads, [.init(type: .channel, data: .byteBuffer(payload))])
+        XCTAssertTrue(sibling.isActive)
+    }
+}
+
+extension EndToEndTests {
+    func testAuthenticatedQueueDrainRetainsCapacityDuringReentrantInitializer() throws {
+        try self.channel.configureWithHarness(TestHarness())
+        let handler = try XCTUnwrap(self.channel.clientSSHHandler)
+        let initialized = NIOLoopBoundBox(0, eventLoop: self.channel.client.eventLoop)
+        let completed = NIOLoopBoundBox(0, eventLoop: self.channel.client.eventLoop)
+        let failures = NIOLoopBoundBox(0, eventLoop: self.channel.client.eventLoop)
+        let refused = NIOLoopBoundBox<Error?>(nil, eventLoop: self.channel.client.eventLoop)
+        let boundHandler = NIOLoopBound(handler, eventLoop: self.channel.client.eventLoop)
+        for _ in 0..<Constants.maximumChannelReservations {
+            let promise = self.channel.client.eventLoop.makePromise(of: Channel.self)
+            promise.futureResult.whenComplete { result in
+                completed.value += 1
+                if case .failure = result { failures.value += 1 }
+            }
+            handler.createChannel(promise) { child, _ in
+                initialized.value += 1
+                if initialized.value == 1 {
+                    let extra = child.eventLoop.makePromise(of: Channel.self)
+                    extra.futureResult.whenFailure { refused.value = $0 }
+                    boundHandler.value.createChannel(extra) { unexpected, _ in
+                        XCTFail("Reentrant initializer bypassed queued reservation accounting")
+                        return unexpected.eventLoop.makeSucceededFuture(())
+                    }
+                }
+                return child.eventLoop.makeSucceededFuture(())
+            }
+        }
+        XCTAssertEqual(initialized.value, 0)
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, Constants.maximumChannelReservations)
+        try self.channel.activate()
+        try self.channel.interactInMemory()
+        XCTAssertEqual(initialized.value, Constants.maximumChannelReservations)
+        XCTAssertEqual(completed.value, Constants.maximumChannelReservations)
+        XCTAssertEqual(failures.value, 0)
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, 0)
+        XCTAssertEqual((refused.value as? NIOSSHError)?.type, .channelResourceLimit)
+        XCTAssertTrue(self.channel.client.isActive)
+        XCTAssertTrue(self.channel.server.isActive)
+    }
+}
