@@ -642,6 +642,7 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
         // we can just wait.
         if !self.expectingChannelReadComplete {
             self.context?.flush()
+            self.scheduleTerminalControlDrain()
         }
     }
 }

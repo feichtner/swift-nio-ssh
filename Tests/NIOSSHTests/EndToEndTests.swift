@@ -1076,3 +1076,69 @@ extension EndToEndTests {
         XCTAssertTrue(peer.isActive)
     }
 }
+
+private final class AbortChildOnParentFlush: ChannelOutboundHandler, Sendable {
+    typealias OutboundIn = Any
+    let child: NIOLoopBound<Channel>
+    let fired: NIOLoopBoundBox<Bool>
+
+    init(child: Channel) {
+        self.child = NIOLoopBound(child, eventLoop: child.eventLoop)
+        self.fired = NIOLoopBoundBox(false, eventLoop: child.eventLoop)
+    }
+
+    func flush(context: ChannelHandlerContext) {
+        if !self.fired.value {
+            self.fired.value = true
+            self.child.value.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        }
+        context.flush()
+    }
+}
+
+extension EndToEndTests {
+    func testAbortFromParentFlushDrainsReentrantCloseWithoutFurtherIO() throws {
+        let pair = BackToBackEmbeddedChannel()
+        defer { XCTAssertNoThrow(try pair.finish()) }
+        try pair.configureWithHarness(TestHarness())
+        try pair.activate()
+        try pair.interactInMemory()
+        let first = try pair.createNewChannel()
+        try pair.interactInMemory()
+        let second = try pair.createNewChannel()
+        try pair.interactInMemory()
+        XCTAssertEqual(pair.activeServerChannels.count, 2)
+        let flush = AbortChildOnParentFlush(child: second)
+        try pair.client.pipeline.syncOperations.addHandler(flush, position: .first)
+        let terminal = NIOLoopBoundBox(0, eventLoop: first.eventLoop)
+        for child in [first, second] {
+            child.closeFuture.whenFailure { error in
+                XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+                terminal.value += 1
+            }
+        }
+        first.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        // No network delivery, child write or readComplete may trigger B's
+        // retry. Only the queued drain/cleanup tasks can make progress.
+        pair.run()
+        XCTAssertTrue(flush.fired.value)
+        XCTAssertEqual(terminal.value, 2)
+        XCTAssertEqual(pair.activeServerChannels.count, 2)
+        let firstClose = try XCTUnwrap(pair.client.readOutbound(as: IOData.self))
+        let secondClose = try XCTUnwrap(pair.client.readOutbound(as: IOData.self))
+        XCTAssertNil(try pair.client.readOutbound(as: IOData.self))
+        try pair.server.writeInbound(firstClose)
+        try pair.server.writeInbound(secondClose)
+        try pair.interactInMemory()
+        XCTAssertTrue(pair.activeServerChannels.isEmpty)
+        // Both original reservations must release after the real peer ACKs;
+        // admit the full fixed budget without evicting/reusing held IDs.
+        for _ in 0..<Constants.maximumChannelReservations {
+            _ = try pair.createNewChannel()
+        }
+        try pair.interactInMemory()
+        XCTAssertEqual(pair.activeServerChannels.count, Constants.maximumChannelReservations)
+        XCTAssertTrue(pair.client.isActive)
+        XCTAssertTrue(pair.server.isActive)
+    }
+}
