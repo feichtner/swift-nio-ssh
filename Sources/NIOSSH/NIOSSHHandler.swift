@@ -47,6 +47,19 @@ public final class NIOSSHHandler {
 
     // Whether we're expecting a channelReadComplete.
     private var expectingChannelReadComplete: Bool = false
+    private var writingFrame = false
+    private var terminalControlDrainScheduled = false
+
+    private func scheduleTerminalControlDrain() {
+        guard !self.terminalControlDrainScheduled, let context = self.context else { return }
+        self.terminalControlDrainScheduled = true
+        let owner = NIOLoopBound(self, eventLoop: context.eventLoop)
+        context.eventLoop.execute {
+            let handler = owner.value
+            handler.terminalControlDrainScheduled = false
+            handler.multiplexer?.drainTerminalControls()
+        }
+    }
 
     // A buffer of pending channel initializations. A channel initialization is pending if
     // we're attempting to initialize a channel before user auth is complete.
@@ -168,6 +181,7 @@ extension NIOSSHHandler: ChannelDuplexHandler {
     }
 
     public func channelRead(context: ChannelHandlerContext, data: NIOAny) {
+        defer { self.scheduleTerminalControlDrain() }
         self.expectingChannelReadComplete = true
 
         var data = self.unwrapInboundIn(data)
@@ -203,6 +217,11 @@ extension NIOSSHHandler: ChannelDuplexHandler {
         context: ChannelHandlerContext,
         promise: EventLoopPromise<Void>? = nil
     ) throws {
+        self.writingFrame = true
+        defer {
+            self.writingFrame = false
+            self.scheduleTerminalControlDrain()
+        }
         self.outboundFrameBuffer.clear()
 
         for message in multiMessage {
@@ -557,6 +576,31 @@ extension NIOSSHHandler {
 // MARK: Functions called from the multiplexer
 
 extension NIOSSHHandler: SSHMultiplexerDelegate {
+    var canSendChannelControlMessages: Bool {
+        self.context != nil && !self.writingFrame && self.stateMachine.canSendChannelControlMessages
+    }
+
+    func writeTerminalControl(_ message: SSHMessage) throws {
+        guard let context = self.context else { throw ChannelError.ioOnClosedChannel }
+        let completion = context.eventLoop.makePromise(of: Void.self)
+        do {
+            try self.writeMessage(SSHMultiMessage(message), context: context, promise: completion)
+        } catch {
+            // No context.write owns the promise if serialization threw. Settle
+            // it here; only the multiplexer reports this synchronous failure.
+            completion.fail(error)
+            throw error
+        }
+        let owner = NIOLoopBound(self, eventLoop: context.eventLoop)
+        completion.futureResult.whenFailure { error in owner.value.terminalControlWriteFailed(error) }
+    }
+
+    func terminalControlWriteFailed(_ error: Error) {
+        guard let context = self.context else { return }
+        context.fireErrorCaught(error)
+        context.close(promise: nil)
+    }
+
     func writeFromChildChannel(_ message: SSHMessage, _ promise: EventLoopPromise<Void>?) {
         guard let context = self.context else {
             promise?.fail(ChannelError.ioOnClosedChannel)
@@ -567,6 +611,14 @@ extension NIOSSHHandler: SSHMultiplexerDelegate {
             try self.writeMessage(SSHMultiMessage(message), context: context, promise: promise)
         } catch {
             promise?.fail(error)
+            switch message {
+            case .channelClose, .channelOpenFailure:
+                // An unreserved terminal response cannot enter the bounded
+                // admitted-channel queue. Never silently drop it or append an
+                // unbounded overflow list: explicitly fail this transport.
+                self.terminalControlWriteFailed(error)
+            default: break
+            }
         }
     }
 

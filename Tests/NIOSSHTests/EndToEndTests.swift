@@ -928,3 +928,56 @@ extension EndToEndTests {
         XCTAssertTrue(self.channel.server.isActive)
     }
 }
+
+extension EndToEndTests {
+    func testAbortDuringRealRekeyEventuallyClosesPeerAndPreservesSibling() throws {
+        for serverInitiated in [false, true] {
+            let pair = BackToBackEmbeddedChannel()
+            defer { XCTAssertNoThrow(try pair.finish()) }
+            try pair.configureWithHarness(TestHarness())
+            try pair.activate()
+            try pair.interactInMemory()
+            let target = try pair.createNewChannel()
+            try pair.interactInMemory()
+            let remoteTarget = try XCTUnwrap(pair.activeServerChannels.first)
+            let sibling = try pair.createNewChannel()
+            try pair.interactInMemory()
+            let remoteSibling = try XCTUnwrap(pair.activeServerChannels.last)
+            let reads = NIOLoopBound(ReadRecordingHandler(), eventLoop: remoteSibling.eventLoop)
+            try remoteSibling.pipeline.syncOperations.addHandler(reads.value)
+            if serverInitiated {
+                try XCTUnwrap(pair.serverSSHHandler)._rekey()
+                // Deliver only the initiating KEXINIT, never complete rekey.
+                let kex = try XCTUnwrap(pair.server.readOutbound(as: IOData.self))
+                try pair.client.writeInbound(kex)
+            } else {
+                try XCTUnwrap(pair.clientSSHHandler)._rekey()
+            }
+            XCTAssertFalse(try XCTUnwrap(pair.clientSSHHandler).canSendChannelControlMessages)
+            let terminal = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: target.eventLoop)
+            target.closeFuture.whenComplete { terminal.value = $0 }
+            target.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+            pair.run()
+            if case .failure(let error)? = terminal.value {
+                XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+            } else {
+                XCTFail("Local abort must join without completing rekey")
+            }
+            XCTAssertFalse(target.isActive)
+            XCTAssertTrue(remoteTarget.isActive)
+            XCTAssertTrue(sibling.isActive)
+            XCTAssertTrue(pair.client.isActive)
+            XCTAssertTrue(pair.server.isActive)
+            try pair.interactInMemory()
+            XCTAssertFalse(remoteTarget.isActive)
+            XCTAssertEqual(pair.activeServerChannels.count, 1)
+            let payload = ByteBuffer(string: "sibling after abort during real rekey")
+            sibling.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(payload)), promise: nil)
+            try pair.interactInMemory()
+            XCTAssertEqual(reads.value.reads, [.init(type: .channel, data: .byteBuffer(payload))])
+            XCTAssertTrue(sibling.isActive)
+            XCTAssertTrue(pair.client.isActive)
+            XCTAssertTrue(pair.server.isActive)
+        }
+    }
+}

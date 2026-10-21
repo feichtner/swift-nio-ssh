@@ -18,9 +18,19 @@ import NIOCore
 final class SSHChannelMultiplexer {
     private var channels: [UInt32: SSHChildChannel]
 
-    enum Quarantine: Equatable { case awaitingOpenResponse, awaitingClose }
+    enum Quarantine: Equatable { case awaitingOpenResponse, awaitingClose, rejectingOpen }
 
-    private var erroredChannels: [UInt32: Quarantine]
+    private struct TerminalReservation {
+        var phase: Quarantine
+        var owed: SSHMessage?
+        var sent: Bool
+        var sending = false
+        var peerClosed = false
+    }
+    // Owed terminal controls share their original reservation, never a second
+    // unbounded queue or a live child. Only one control may be owed per ID.
+    private var erroredChannels: [UInt32: TerminalReservation]
+    private var drainingTerminalControls = false
     private let maximumReservations: Int
 
     // This object can cause a reference cycle, so we require it to be optional so that we can
@@ -74,13 +84,72 @@ final class SSHChannelMultiplexer {
 
 extension SSHChannelMultiplexer {
     /// An `SSHChildChannel` has issued a write.
-    func writeFromChannel(_ message: SSHMessage, _ promise: EventLoopPromise<Void>?) {
+    func writeFromChannel(_ message: SSHMessage, _ promise: EventLoopPromise<Void>?, from localID: UInt32? = nil) {
         guard let delegate = self.delegate else {
             promise?.fail(ChannelError.ioOnClosedChannel)
             return
         }
 
+        // Ordinary CLOSE may precede explicit abort. Retain its obligation too;
+        // otherwise sentClose would hide an earlier rekey-rejected write.
+        if let localID, self.erroredChannels[localID] == nil, self.channels[localID] != nil {
+            switch message {
+            case .channelClose:
+                self.erroredChannels[localID] = TerminalReservation(phase: .awaitingClose, sent: false)
+            case .channelOpenFailure:
+                self.erroredChannels[localID] = TerminalReservation(phase: .rejectingOpen, sent: false)
+            default: break
+            }
+        }
+        if let localID, var reservation = self.erroredChannels[localID] {
+            switch message {
+            case .channelClose where reservation.phase == .awaitingClose,
+                .channelOpenFailure where reservation.phase == .rejectingOpen:
+                // Terminal cleanup uses nil promises. Its public completion is
+                // local closeFuture, not a claim that the peer received this.
+                precondition(promise == nil)
+                if !reservation.sent && !reservation.sending && reservation.owed == nil {
+                    reservation.owed = message
+                    self.erroredChannels[localID] = reservation
+                }
+                self.drainTerminalControls()
+                return
+            default: break
+            }
+        }
         delegate.writeFromChildChannel(message, promise)
+    }
+
+    func drainTerminalControls() {
+        guard !self.drainingTerminalControls, let delegate = self.delegate else { return }
+        self.drainingTerminalControls = true
+        defer { self.drainingTerminalControls = false }
+        // Snapshot IDs, then revalidate each original reservation after every
+        // outcall. No captured writability or child liveness can authorize it.
+        for id in Array(self.erroredChannels.keys) {
+            guard delegate.canSendChannelControlMessages else { return }
+            guard var reservation = self.erroredChannels[id], let message = reservation.owed else { continue }
+            reservation.owed = nil
+            reservation.sending = true
+            self.erroredChannels[id] = reservation
+            do {
+                try delegate.writeTerminalControl(message)
+            } catch {
+                // Serialization/transport failure other than known rekey is
+                // terminal, never a blind replay after ambiguous acceptance.
+                delegate.terminalControlWriteFailed(error)
+                return
+            }
+            guard var current = self.erroredChannels[id] else { continue }
+            current.sending = false
+            current.sent = true
+            if current.phase == .rejectingOpen || current.peerClosed {
+                self.erroredChannels.removeValue(forKey: id)
+            } else {
+                self.erroredChannels[id] = current
+            }
+            delegate.flushFromChildChannel()
+        }
     }
 
     /// An `SSHChildChannel` has issued a flush.
@@ -97,15 +166,34 @@ extension SSHChannelMultiplexer {
         // This should never return `nil`, but we don't want to assert on it because
         // even if the object was never in the map, nothing bad will happen: it's gone!
         self.channels.removeValue(forKey: channelID)
+        if var reservation = self.erroredChannels[channelID] {
+            reservation.peerClosed = true
+            if reservation.sent {
+                self.erroredChannels.removeValue(forKey: channelID)
+            } else {
+                self.erroredChannels[channelID] = reservation
+            }
+        }
     }
 
-    func childChannelErrored(channelID: UInt32, quarantine: Quarantine?) {
+    func childChannelErrored(channelID: UInt32, quarantine: Quarantine?, terminalControlAlreadySent: Bool) {
         self.channels.removeValue(forKey: channelID)
-        if self.canCreateNewChannels, let quarantine { self.erroredChannels[channelID] = quarantine }
+        if self.canCreateNewChannels, let quarantine {
+            if var retained = self.erroredChannels[channelID] {
+                retained.phase = quarantine
+                self.erroredChannels[channelID] = retained
+            } else {
+                self.erroredChannels[channelID] = TerminalReservation(
+                    phase: quarantine,
+                    sent: terminalControlAlreadySent
+                )
+            }
+        }
     }
 
     var availableChannelReservations: Int {
-        self.maximumReservations - self.channels.count - self.erroredChannels.count
+        self.maximumReservations - self.channels.count
+            - self.erroredChannels.keys.filter { self.channels[$0] == nil }.count
     }
 
     var canReserveChannel: Bool {
@@ -120,15 +208,32 @@ extension SSHChannelMultiplexer {
     func receiveMessage(_ message: SSHMessage) throws {
         // Quarantine consumes only bounded protocol metadata, never a live
         // child. A late confirmation must be answered without reactivation.
-        if let localID = message.recipientChannelID, let phase = self.erroredChannels[localID] {
+        if let localID = message.recipientChannelID, var reservation = self.erroredChannels[localID] {
+            if let live = self.channels[localID] {
+                if case .channelClose = message {
+                    reservation.peerClosed = true
+                    self.erroredChannels[localID] = reservation
+                }
+                live.receiveInboundMessage(message)
+                return
+            }
             switch message {
-            case .channelOpenConfirmation(let reply) where phase == .awaitingOpenResponse:
-                self.erroredChannels[localID] = .awaitingClose
-                self.writeFromChannel(.channelClose(.init(recipientChannel: reply.senderChannel)), nil)
-                self.childChannelFlush()
-            case .channelOpenFailure where phase == .awaitingOpenResponse,
-                .channelClose where phase == .awaitingClose:
+            case .channelOpenConfirmation(let reply) where reservation.phase == .awaitingOpenResponse:
+                reservation.phase = .awaitingClose
+                reservation.sent = false
+                self.erroredChannels[localID] = reservation
+                self.writeFromChannel(.channelClose(.init(recipientChannel: reply.senderChannel)), nil, from: localID)
+            case .channelOpenFailure where reservation.phase == .awaitingOpenResponse:
                 self.erroredChannels.removeValue(forKey: localID)
+            case .channelClose where reservation.phase == .awaitingClose:
+                // An ACK arriving before our queued CLOSE is serialized must
+                // not release its ID or discard the required response.
+                if reservation.sent && !reservation.sending {
+                    self.erroredChannels.removeValue(forKey: localID)
+                } else {
+                    reservation.peerClosed = true
+                    self.erroredChannels[localID] = reservation
+                }
             default: break
             }
             return
@@ -289,6 +394,18 @@ protocol SSHMultiplexerDelegate {
     func writeFromChildChannel(_: SSHMessage, _: EventLoopPromise<Void>?)
 
     func flushFromChildChannel()
+    var canSendChannelControlMessages: Bool { get }
+    func writeTerminalControl(_ message: SSHMessage) throws
+    func terminalControlWriteFailed(_ error: Error)
+}
+
+extension SSHMultiplexerDelegate {
+    var canSendChannelControlMessages: Bool { true }
+    func writeTerminalControl(_ message: SSHMessage) throws { self.writeFromChildChannel(message, nil) }
+    func terminalControlWriteFailed(_ error: Error) {
+        self.channel?.pipeline.fireErrorCaught(error)
+        self.channel?.close(promise: nil)
+    }
 }
 
 extension SSHMessage {

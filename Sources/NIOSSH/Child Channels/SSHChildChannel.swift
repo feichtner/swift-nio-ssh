@@ -623,6 +623,13 @@ extension SSHChildChannel: Channel, ChannelCore {
         guard !self.didClose else { return }
         self.didClose = true
 
+        let terminalControlAlreadySent = self.state.sentClose
+        let rejectingOpen =
+            (self.state.isActiveOnNetwork && !self.state.isActiveOnChannel)
+            || self.pendingWritesForMultiplexer.contains {
+                if case .channelOpenFailure = $0.0 { return true }
+                return false
+            }
         // Decide the wire transition before making outcalls. An unconfirmed
         // local OPEN has no peer ID; a remote OPEN must be rejected, not CLOSEd.
         if self.state.isActiveOnNetwork, let peerID = self.state.remoteChannelIdentifier {
@@ -643,14 +650,20 @@ extension SSHChildChannel: Channel, ChannelCore {
             }
         }
         let quarantine: SSHChannelMultiplexer.Quarantine?
-        if self.state.isActiveOnNetwork {
+        if rejectingOpen && self.state.remoteChannelIdentifier != nil {
+            quarantine = .rejectingOpen
+        } else if self.state.isActiveOnNetwork {
             quarantine = self.state.remoteChannelIdentifier == nil ? .awaitingOpenResponse : .awaitingClose
         } else {
             quarantine = nil
         }
         // Detach BEFORE outbound/inactive/future callbacks can reenter. The
         // reservation is transferred, never briefly released or counted twice.
-        self.multiplexer.childChannelErrored(channelID: self.state.localChannelIdentifier, quarantine: quarantine)
+        self.multiplexer.childChannelErrored(
+            channelID: self.state.localChannelIdentifier,
+            quarantine: quarantine,
+            terminalControlAlreadySent: terminalControlAlreadySent && !rejectingOpen
+        )
         self.writePendingToMultiplexer()
 
         self.deliverPendingReads()
@@ -1094,7 +1107,7 @@ extension SSHChildChannel {
         var didWrite = false
         while let (write, promise) = self.pendingWritesForMultiplexer.popFirst() {
             didWrite = true
-            self.multiplexer.writeFromChannel(write, promise)
+            self.multiplexer.writeFromChannel(write, promise, from: self.state.localChannelIdentifier)
         }
 
         if didWrite {

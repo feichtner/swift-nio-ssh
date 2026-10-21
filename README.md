@@ -166,3 +166,11 @@ receive resource shortage; existing sessions are not disconnected or evicted.
 A peer that never finishes close can exhaust this admission budget until the
 connection naturally ends. This deliberate backpressure never reuses an ID
 before its protocol release, including at allocator wrap.
+Required CLOSE and admitted OPEN_FAILURE responses retain their original
+reservation while rekey temporarily forbids their serialization, and are sent
+once our NEWKEYS permits channel messages. Local cleanup does not wait for rekey
+or peer acknowledgement. An unexpected terminal-control serialization/write
+failure explicitly fails the parent transport rather than silently losing the
+response. Capacity-rejection responses have no admitted reservation: if such a
+response cannot be serialized, the transport fails instead of growing an
+unbounded overflow queue. This exceptional failure may also terminate siblings.
