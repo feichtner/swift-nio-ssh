@@ -20,3 +20,5 @@ instead:
   in `kexsntrup761x25519.c`), `randombytes` as a chunked `getentropy`
   loop, and a plain FIPS 180-4 SHA-512 (upstream maps it to libcrypto,
   which this package does not depend on).
+
+The project license-header check excludes only the unchanged public-domain `sntrup761.c`; the dedicated upstream byte-identity check remains enabled.

@@ -227,7 +227,12 @@ final class SNTRUP761X25519KeyExchangeTests: XCTestCase {
                 + "47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"
         )
         XCTAssertEqual(
-            sha512Hex(Array("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu".utf8)),
+            sha512Hex(
+                Array(
+                    "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"
+                        .utf8
+                )
+            ),
             "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018"
                 + "501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"
         )

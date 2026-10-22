@@ -13,6 +13,9 @@
 //===----------------------------------------------------------------------===//
 
 public enum Constants: Sendable {
+    /// Maximum live, quarantined and queued channel reservations per parent.
+    static let maximumChannelReservations = 256
+
     static let version = "SSH-2.0-SwiftNIOSSH_1.0"
 
     /// The default maximum size, in bytes, of a channel data payload that we advertise we are

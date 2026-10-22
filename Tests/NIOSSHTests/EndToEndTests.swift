@@ -19,8 +19,9 @@ import XCTest
 
 @testable import NIOSSH
 
-enum EndToEndTestError: Error {
+enum EndToEndTestError: Error, Equatable {
     case unableToCreateChildChannel
+    case injectedTerminalWriteFailure
 }
 
 class BackToBackEmbeddedChannel {
@@ -849,5 +850,295 @@ class EndToEndTests: XCTestCase {
         XCTAssertThrowsError(try promise.futureResult.wait()) { error in
             XCTAssertEqual(error as? TestError, TestError.bang)
         }
+    }
+}
+
+extension EndToEndTests {
+    func testPublicLocalAbortDoesNotNeedPeerProgressAndSiblingStillTransfers() throws {
+        try self.channel.configureWithHarness(TestHarness())
+        try self.channel.activate()
+        try self.channel.interactInMemory()
+        let first = try self.channel.createNewChannel()
+        try self.channel.interactInMemory()
+        let sibling = try self.channel.createNewChannel()
+        try self.channel.interactInMemory()
+        let remoteSibling = try XCTUnwrap(self.channel.activeServerChannels.last)
+        let reads = NIOLoopBound(ReadRecordingHandler(), eventLoop: remoteSibling.eventLoop)
+        try remoteSibling.pipeline.syncOperations.addHandler(reads.value)
+        let terminal = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: first.eventLoop)
+        first.closeFuture.whenComplete { terminal.value = $0 }
+        first.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        // Drive local cleanup ONLY: the encrypted peer has not received our
+        // CLOSE, so it cannot possibly have sent its acknowledgement yet.
+        self.channel.run()
+        if case .failure(let error)? = terminal.value {
+            XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+        } else {
+            XCTFail("Local abort waited for remote SSH progress")
+        }
+        XCTAssertFalse(first.isActive)
+        XCTAssertTrue(self.channel.client.isActive)
+        XCTAssertTrue(self.channel.server.isActive)
+        XCTAssertTrue(sibling.isActive)
+        let payload = ByteBuffer(string: "sibling survives local abort")
+        sibling.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(payload)), promise: nil)
+        try self.channel.interactInMemory()
+        XCTAssertEqual(reads.value.reads, [.init(type: .channel, data: .byteBuffer(payload))])
+        XCTAssertTrue(sibling.isActive)
+    }
+}
+
+extension EndToEndTests {
+    func testAuthenticatedQueueDrainRetainsCapacityDuringReentrantInitializer() throws {
+        try self.channel.configureWithHarness(TestHarness())
+        let handler = try XCTUnwrap(self.channel.clientSSHHandler)
+        let initialized = NIOLoopBoundBox(0, eventLoop: self.channel.client.eventLoop)
+        let completed = NIOLoopBoundBox(0, eventLoop: self.channel.client.eventLoop)
+        let failures = NIOLoopBoundBox(0, eventLoop: self.channel.client.eventLoop)
+        let refused = NIOLoopBoundBox<Error?>(nil, eventLoop: self.channel.client.eventLoop)
+        let boundHandler = NIOLoopBound(handler, eventLoop: self.channel.client.eventLoop)
+        for _ in 0..<Constants.maximumChannelReservations {
+            let promise = self.channel.client.eventLoop.makePromise(of: Channel.self)
+            promise.futureResult.whenComplete { result in
+                completed.value += 1
+                if case .failure = result { failures.value += 1 }
+            }
+            handler.createChannel(promise) { child, _ in
+                initialized.value += 1
+                if initialized.value == 1 {
+                    let extra = child.eventLoop.makePromise(of: Channel.self)
+                    extra.futureResult.whenFailure { refused.value = $0 }
+                    boundHandler.value.createChannel(extra) { unexpected, _ in
+                        XCTFail("Reentrant initializer bypassed queued reservation accounting")
+                        return unexpected.eventLoop.makeSucceededFuture(())
+                    }
+                }
+                return child.eventLoop.makeSucceededFuture(())
+            }
+        }
+        XCTAssertEqual(initialized.value, 0)
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, Constants.maximumChannelReservations)
+        try self.channel.activate()
+        try self.channel.interactInMemory()
+        XCTAssertEqual(initialized.value, Constants.maximumChannelReservations)
+        XCTAssertEqual(completed.value, Constants.maximumChannelReservations)
+        XCTAssertEqual(failures.value, 0)
+        XCTAssertEqual(handler.pendingChannelInitializationsCount, 0)
+        XCTAssertEqual((refused.value as? NIOSSHError)?.type, .channelResourceLimit)
+        XCTAssertTrue(self.channel.client.isActive)
+        XCTAssertTrue(self.channel.server.isActive)
+    }
+}
+
+extension EndToEndTests {
+    func testAbortDuringRealRekeyEventuallyClosesPeerAndPreservesSibling() throws {
+        for serverInitiated in [false, true] {
+            let pair = BackToBackEmbeddedChannel()
+            defer { XCTAssertNoThrow(try pair.finish()) }
+            try pair.configureWithHarness(TestHarness())
+            try pair.activate()
+            try pair.interactInMemory()
+            let target = try pair.createNewChannel()
+            try pair.interactInMemory()
+            let remoteTarget = try XCTUnwrap(pair.activeServerChannels.first)
+            let sibling = try pair.createNewChannel()
+            try pair.interactInMemory()
+            let remoteSibling = try XCTUnwrap(pair.activeServerChannels.last)
+            let reads = NIOLoopBound(ReadRecordingHandler(), eventLoop: remoteSibling.eventLoop)
+            try remoteSibling.pipeline.syncOperations.addHandler(reads.value)
+            if serverInitiated {
+                try XCTUnwrap(pair.serverSSHHandler)._rekey()
+                // Deliver only the initiating KEXINIT, never complete rekey.
+                let kex = try XCTUnwrap(pair.server.readOutbound(as: IOData.self))
+                try pair.client.writeInbound(kex)
+            } else {
+                try XCTUnwrap(pair.clientSSHHandler)._rekey()
+            }
+            XCTAssertFalse(try XCTUnwrap(pair.clientSSHHandler).canSendChannelControlMessages)
+            let terminal = NIOLoopBoundBox<Result<Void, Error>?>(nil, eventLoop: target.eventLoop)
+            target.closeFuture.whenComplete { terminal.value = $0 }
+            target.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+            pair.run()
+            if case .failure(let error)? = terminal.value {
+                XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+            } else {
+                XCTFail("Local abort must join without completing rekey")
+            }
+            XCTAssertFalse(target.isActive)
+            XCTAssertTrue(remoteTarget.isActive)
+            XCTAssertTrue(sibling.isActive)
+            XCTAssertTrue(pair.client.isActive)
+            XCTAssertTrue(pair.server.isActive)
+            try pair.interactInMemory()
+            XCTAssertFalse(remoteTarget.isActive)
+            XCTAssertEqual(pair.activeServerChannels.count, 1)
+            let payload = ByteBuffer(string: "sibling after abort during real rekey")
+            sibling.writeAndFlush(SSHChannelData(type: .channel, data: .byteBuffer(payload)), promise: nil)
+            try pair.interactInMemory()
+            XCTAssertEqual(reads.value.reads, [.init(type: .channel, data: .byteBuffer(payload))])
+            XCTAssertTrue(sibling.isActive)
+            XCTAssertTrue(pair.client.isActive)
+            XCTAssertTrue(pair.server.isActive)
+        }
+    }
+}
+
+private final class DelayedTerminalWriteFailure: ChannelOutboundHandler, Sendable {
+    typealias OutboundIn = Any
+    let writes: NIOLoopBoundBox<Int>
+
+    init(writes: NIOLoopBoundBox<Int>) { self.writes = writes }
+
+    func write(context: ChannelHandlerContext, data: NIOAny, promise: EventLoopPromise<Void>?) {
+        self.writes.value += 1
+        // Actual handler-owned promise, failed AFTER context.write returns.
+        // This is deterministic fault injection, not a real network failure.
+        context.eventLoop.execute { promise?.fail(EndToEndTestError.injectedTerminalWriteFailure) }
+    }
+}
+
+extension EndToEndTests {
+    func testUnreservedTerminalAsyncWriteFailurePreservesCallerAndClosesTransportOnce() throws {
+        for openFailure in [false, true] {
+            for withCaller in [false, true] {
+                let pair = BackToBackEmbeddedChannel()
+                defer { XCTAssertNoThrow(try pair.finish()) }
+                try pair.configureWithHarness(TestHarness())
+                try pair.activate()
+                try pair.interactInMemory()
+                let handler = try XCTUnwrap(pair.clientSSHHandler)
+                let writes = NIOLoopBoundBox(0, eventLoop: pair.client.eventLoop)
+                let outcomes = NIOLoopBoundBox(0, eventLoop: pair.client.eventLoop)
+                let errors = ErrorLoggingHandler()
+                try pair.client.pipeline.syncOperations.addHandler(
+                    DelayedTerminalWriteFailure(writes: writes),
+                    position: .first
+                )
+                try pair.client.pipeline.syncOperations.addHandler(errors)
+                let caller = withCaller ? pair.client.eventLoop.makePromise(of: Void.self) : nil
+                caller?.futureResult.whenFailure { error in
+                    XCTAssertEqual(error as? EndToEndTestError, .injectedTerminalWriteFailure)
+                    outcomes.value += 1
+                }
+                let message: SSHMessage =
+                    openFailure
+                    ? .channelOpenFailure(
+                        .init(recipientChannel: 9, reasonCode: 4, description: "limit", language: "en")
+                    )
+                    : .channelClose(.init(recipientChannel: 9))
+                handler.writeFromChildChannel(message, caller)
+                XCTAssertEqual(writes.value, 1)
+                XCTAssertEqual(outcomes.value, 0)
+                XCTAssertTrue(pair.client.isActive)
+                pair.run()
+                XCTAssertEqual(outcomes.value, withCaller ? 1 : 0)
+                XCTAssertEqual(errors.errors.count, 1)
+                XCTAssertEqual(errors.errors.first as? EndToEndTestError, .injectedTerminalWriteFailure)
+                XCTAssertFalse(pair.client.isActive)
+                // A duplicate failure after parent teardown is not a new error.
+                handler.terminalControlWriteFailed(EndToEndTestError.injectedTerminalWriteFailure)
+                XCTAssertThrowsError(try pair.client.throwIfErrorCaught())
+                XCTAssertNoThrow(try pair.client.throwIfErrorCaught())
+                pair.run()
+                XCTAssertEqual(writes.value, 1)
+                XCTAssertEqual(outcomes.value, withCaller ? 1 : 0)
+                XCTAssertEqual(errors.errors.count, 1)
+            }
+        }
+    }
+}
+
+extension EndToEndTests {
+    func testOrdinaryDataTrafficDoesNotScheduleTerminalControlTasks() throws {
+        let pair = BackToBackEmbeddedChannel()
+        defer { XCTAssertNoThrow(try pair.finish()) }
+        try pair.configureWithHarness(TestHarness())
+        try pair.activate()
+        try pair.interactInMemory()
+        let child = try pair.createNewChannel()
+        try pair.interactInMemory()
+        let peer = try XCTUnwrap(pair.activeServerChannels.first)
+        let reads = NIOLoopBound(ReadRecordingHandler(), eventLoop: peer.eventLoop)
+        try peer.pipeline.syncOperations.addHandler(reads.value)
+        let client = try XCTUnwrap(pair.clientSSHHandler)
+        let server = try XCTUnwrap(pair.serverSSHHandler)
+        let payload = SSHChannelData(type: .channel, data: .byteBuffer(ByteBuffer(string: "ordinary data")))
+        for _ in 0..<8 {
+            child.writeAndFlush(payload, promise: nil)
+            // Observe immediately, before any queued task could clear the flag.
+            XCTAssertFalse(client.terminalControlDrainScheduled)
+            let packet = try XCTUnwrap(pair.client.readOutbound(as: IOData.self))
+            try pair.server.writeInbound(packet)
+            XCTAssertFalse(server.terminalControlDrainScheduled)
+        }
+        XCTAssertEqual(reads.value.reads, Array(repeating: payload, count: 8))
+        XCTAssertTrue(child.isActive)
+        XCTAssertTrue(peer.isActive)
+    }
+}
+
+private final class AbortChildOnParentFlush: ChannelOutboundHandler, Sendable {
+    typealias OutboundIn = Any
+    let child: NIOLoopBound<Channel>
+    let fired: NIOLoopBoundBox<Bool>
+
+    init(child: Channel) {
+        self.child = NIOLoopBound(child, eventLoop: child.eventLoop)
+        self.fired = NIOLoopBoundBox(false, eventLoop: child.eventLoop)
+    }
+
+    func flush(context: ChannelHandlerContext) {
+        if !self.fired.value {
+            self.fired.value = true
+            self.child.value.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        }
+        context.flush()
+    }
+}
+
+extension EndToEndTests {
+    func testAbortFromParentFlushDrainsReentrantCloseWithoutFurtherIO() throws {
+        let pair = BackToBackEmbeddedChannel()
+        defer { XCTAssertNoThrow(try pair.finish()) }
+        try pair.configureWithHarness(TestHarness())
+        try pair.activate()
+        try pair.interactInMemory()
+        let first = try pair.createNewChannel()
+        try pair.interactInMemory()
+        let second = try pair.createNewChannel()
+        try pair.interactInMemory()
+        XCTAssertEqual(pair.activeServerChannels.count, 2)
+        let flush = AbortChildOnParentFlush(child: second)
+        try pair.client.pipeline.syncOperations.addHandler(flush, position: .first)
+        let terminal = NIOLoopBoundBox(0, eventLoop: first.eventLoop)
+        for child in [first, second] {
+            child.closeFuture.whenFailure { error in
+                XCTAssertEqual((error as? NIOSSHError)?.type, .channelAborted)
+                terminal.value += 1
+            }
+        }
+        first.triggerUserOutboundEvent(SSHChannelAbortEvent(), promise: nil)
+        // No network delivery, child write or readComplete may trigger B's
+        // retry. Only the queued drain/cleanup tasks can make progress.
+        pair.run()
+        XCTAssertTrue(flush.fired.value)
+        XCTAssertEqual(terminal.value, 2)
+        XCTAssertEqual(pair.activeServerChannels.count, 2)
+        let firstClose = try XCTUnwrap(pair.client.readOutbound(as: IOData.self))
+        let secondClose = try XCTUnwrap(pair.client.readOutbound(as: IOData.self))
+        XCTAssertNil(try pair.client.readOutbound(as: IOData.self))
+        try pair.server.writeInbound(firstClose)
+        try pair.server.writeInbound(secondClose)
+        try pair.interactInMemory()
+        XCTAssertTrue(pair.activeServerChannels.isEmpty)
+        // Both original reservations must release after the real peer ACKs;
+        // admit the full fixed budget without evicting/reusing held IDs.
+        for _ in 0..<Constants.maximumChannelReservations {
+            _ = try pair.createNewChannel()
+        }
+        try pair.interactInMemory()
+        XCTAssertEqual(pair.activeServerChannels.count, Constants.maximumChannelReservations)
+        XCTAssertTrue(pair.client.isActive)
+        XCTAssertTrue(pair.server.isActive)
     }
 }

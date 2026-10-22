@@ -1239,6 +1239,15 @@ extension SSHConnectionStateMachine {
 // MARK: Helper properties
 
 extension SSHConnectionStateMachine {
+    /// Outbound channel controls are legal after OUR NEWKEYS, even before the
+    /// peer NEWKEYS. No initial-handshake or disconnected state queues controls.
+    var canSendChannelControlMessages: Bool {
+        switch self.state {
+        case .active, .rekeyingSentNewKeysState: return true
+        default: return false
+        }
+    }
+
     var isActive: Bool {
         switch self.state {
         case .active:

@@ -147,3 +147,36 @@ Global requests are initiated using `NIOSSHHandler.sendGlobalRequest`, and are r
 Servers may be notified of and respond to these requests using a `GlobalRequestDelegate`. The method to implement here is `tcpForwardingRequest(_:handler:promise:)`. This delegate method will be invoked any time a global request is received. The response to the request is passed into `promise`.
 
 Forwarded channels are then sent from server to client using the `.forwardedTCPIP` channel type.
+
+### Dedicated child local abort
+
+Send `SSHChannelAbortEvent()` with `child.triggerUserOutboundEvent` to terminate
+one dedicated child locally without waiting for peer CLOSE. The event promise
+and `child.closeFuture` finish after local handlers are removed, with
+`NIOSSHError.ErrorType.channelAborted`. The SSH parent and other children remain
+available. `closeFuture` retains its original result; events sent after pipeline
+removal fail as closed. Join actual cleanup with `closeFuture`.
+
+Local termination does not acknowledge remote CLOSE, stop a remote process or
+undo an acknowledged write. The connection retains the channel ID until its
+open/close handshake permits release, including a late OPEN confirmation.
+A parent admits at most 256 live, quarantined and queued channel reservations.
+At capacity, new local opens fail with `channelResourceLimit` and inbound opens
+receive resource shortage; existing sessions are not disconnected or evicted.
+A peer that never finishes close can exhaust this admission budget until the
+connection naturally ends. This deliberate backpressure never reuses an ID
+before its protocol release, including at allocator wrap.
+Required CLOSE and admitted OPEN_FAILURE responses retain their original
+reservation while rekey temporarily forbids their serialization, and are sent
+once our NEWKEYS permits channel messages. Local cleanup does not wait for rekey
+or peer acknowledgement. An unexpected terminal-control serialization/write
+failure explicitly fails the parent transport rather than silently losing the
+response. Capacity-rejection responses have no admitted reservation: if such a
+response cannot be serialized, the transport fails instead of growing an
+unbounded overflow queue. This exceptional failure may also terminate siblings.
+
+The 256-reservation bound is fixed; no public pressure/configuration API is
+provided. Applications observe `channelResourceLimit`, rather than inferring
+that local cleanup freed a peer's unfinished handshake. Local cleanup requires
+event-loop progress and cannot cancel an application-owned initializer task.
+The abort event promise mirrors local `closeFuture`, not peer acknowledgement.

@@ -23,14 +23,13 @@ jobs:
     runs-on: ubuntu-latest
     container: swift:6.2
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
       - name: Verify vendored sntrup761.c is byte-identical to upstream
         run: |
           apt-get update -qq && apt-get install -y -qq curl >/dev/null
-          curl -sf https://raw.githubusercontent.com/openssh/openssh-portable/master/sntrup761.c \
-            -o /tmp/sntrup761-upstream.c
+          curl -sf https://raw.githubusercontent.com/openssh/openssh-portable/master/sntrup761.c -o /tmp/sntrup761-upstream.c # ignore-unacceptable-language: literal third-party branch reference
           if ! diff -q /tmp/sntrup761-upstream.c Sources/CNIOSSHSNTRUP761/sntrup761.c; then
-            echo "::warning::vendored sntrup761.c differs from current openssh-portable master —"
+            echo "::warning::vendored sntrup761.c differs from current openssh-portable default branch —"
             echo "::warning::either upstream moved (refresh + re-test) or the vendored copy was edited (forbidden)."
           fi
       - name: Test
