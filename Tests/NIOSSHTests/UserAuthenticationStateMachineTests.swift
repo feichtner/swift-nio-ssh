@@ -204,7 +204,9 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
         try self.beginAuthentication(stateMachine: &machine)
         machine.sendServiceRequest(.init(service: "ssh-userauth"))
         try self.serviceAccepted(
-            service: "ssh-userauth", nextMessage: Self.passwordRequest, stateMachine: &machine
+            service: "ssh-userauth",
+            nextMessage: Self.passwordRequest,
+            stateMachine: &machine
         )
         return machine
     }

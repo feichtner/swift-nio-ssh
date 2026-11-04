@@ -242,7 +242,9 @@ extension UserAuthenticationStateMachine {
             self.state = .awaitingNextRequest(attempts: attempts)
             precondition(responseCount == 1, "We don't support parallel authentication attempts yet!")
             return self.requestNextAuthRequest(
-                methods: .init(message), partialSuccess: message.partialSuccess, delegate: delegate
+                methods: .init(message),
+                partialSuccess: message.partialSuccess,
+                delegate: delegate
             )
         case (.client, .authenticationSucceeded):
             // We should ignore all further auth messages in this state.
@@ -472,7 +474,9 @@ extension UserAuthenticationStateMachine {
     ) -> EventLoopFuture<SSHMessage.UserAuthRequestMessage?> {
         let promise = self.loop.makePromise(of: NIOSSHUserAuthenticationOffer?.self)
         delegate.nextAuthenticationType(
-            availableMethods: methods, partialSuccess: partialSuccess, nextChallengePromise: promise
+            availableMethods: methods,
+            partialSuccess: partialSuccess,
+            nextChallengePromise: promise
         )
 
         // The explicit capture list is here to force a copy of the buffer, rather than capturing self.
