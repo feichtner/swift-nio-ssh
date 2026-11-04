@@ -38,4 +38,34 @@ public protocol NIOSSHClientUserAuthenticationDelegate {
         availableMethods: NIOSSHAvailableUserAuthenticationMethods,
         nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
     )
+
+    /// Called with the server's partial-success flag when requesting another authentication offer.
+    ///
+    /// `partialSuccess` is false for the initial offer. After a user-auth failure it is the flag from
+    /// that specific response: true means the preceding request succeeded but further authentication
+    /// is required, not that authentication is complete. It is not accumulated across responses.
+    /// `availableMethods` contains only method options, exactly as in the original callback.
+    ///
+    /// The default implementation calls the original callback once, preserving existing delegates.
+    /// Implement this overload to distinguish partial success from a clean rejection.
+    ///
+    /// - parameters:
+    ///     - availableMethods: The authentication methods the server is willing to accept.
+    ///     - partialSuccess: Whether the preceding request partially succeeded, or false initially.
+    ///     - nextChallengePromise: An `EventLoopPromise` to be fulfilled with the next authentication offer.
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        partialSuccess: Bool,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    )
+}
+
+extension NIOSSHClientUserAuthenticationDelegate {
+    public func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        partialSuccess: Bool,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        self.nextAuthenticationType(availableMethods: availableMethods, nextChallengePromise: nextChallengePromise)
+    }
 }

@@ -144,6 +144,73 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
         self.hostKey = nil
     }
 
+    func testPartialSuccessReachesDelegateForEachResponse() throws {
+        let delegate = PartialSuccessRecordingDelegate()
+        var machine = try self.passwordClient(delegate: delegate)
+        XCTAssertEqual(delegate.partialSuccess, [false])
+        XCTAssertEqual(delegate.methods, [.all])
+
+        let responses: [(Bool, [Substring], NIOSSHAvailableUserAuthenticationMethods)] = [
+            (true, ["password"], .password),
+            (false, ["publickey", "unrecognized"], .publicKey),
+            (true, [], []),
+        ]
+        for (partial, methods, expected) in responses {
+            machine.sendUserAuthRequest(Self.passwordRequest)
+            try self.authFailed(
+                failure: .init(authentications: methods, partialSuccess: partial),
+                nextMessage: Self.passwordRequest,
+                stateMachine: &machine
+            )
+            XCTAssertEqual(delegate.partialSuccess.last, partial)
+            XCTAssertEqual(delegate.methods.last, expected)
+        }
+        XCTAssertEqual(delegate.partialSuccess, [false, true, false, true])
+        XCTAssertEqual(delegate.methods, [.all, .password, .publicKey, []])
+        XCTAssertEqual(delegate.legacyCalls, 0)
+
+        machine.sendUserAuthRequest(Self.passwordRequest)
+        try machine.receiveUserAuthSuccess()
+        XCTAssertNil(try machine.receiveUserAuthFailure(.init(authentications: [], partialSuccess: true)))
+        XCTAssertEqual(delegate.partialSuccess.count, 4)
+    }
+
+    func testLegacyDelegateReceivesUnchangedMethodsForEitherFailureFlag() throws {
+        for partial in [false, true] {
+            let delegate = LegacyMethodsRecordingDelegate()
+            var machine = try self.passwordClient(delegate: delegate)
+            machine.sendUserAuthRequest(Self.passwordRequest)
+            try self.authFailed(
+                failure: .init(authentications: ["password", "unrecognized"], partialSuccess: partial),
+                nextMessage: Self.passwordRequest,
+                stateMachine: &machine
+            )
+            XCTAssertEqual(delegate.methods, [.all, .password])
+        }
+    }
+
+    private static var passwordRequest: SSHMessage.UserAuthRequestMessage {
+        .init(username: "foo", service: "ssh-connection", method: .password("bar"))
+    }
+
+    private func passwordClient(
+        delegate: NIOSSHClientUserAuthenticationDelegate
+    ) throws -> UserAuthenticationStateMachine {
+        var machine = UserAuthenticationStateMachine(
+            role: .client(.init(userAuthDelegate: delegate, serverAuthDelegate: AcceptAllHostKeysDelegate())),
+            loop: self.loop,
+            sessionID: self.sessionID
+        )
+        try self.beginAuthentication(stateMachine: &machine)
+        machine.sendServiceRequest(.init(service: "ssh-userauth"))
+        try self.serviceAccepted(
+            service: "ssh-userauth",
+            nextMessage: Self.passwordRequest,
+            stateMachine: &machine
+        )
+        return machine
+    }
+
     func beginAuthentication(stateMachine: inout UserAuthenticationStateMachine) throws {
         let expectedMessage = SSHMessage.ServiceRequestMessage(service: "ssh-userauth")
         let request: SSHMessage.ServiceRequestMessage? = try assertNoThrowWithValue(stateMachine.beginAuthentication())
@@ -1429,6 +1496,47 @@ final class UserAuthenticationStateMachineTests: XCTestCase {
             request: authRequest,
             expectingDisconnect: disconnect,
             stateMachine: &stateMachine
+        )
+    }
+}
+
+private final class LegacyMethodsRecordingDelegate: NIOSSHClientUserAuthenticationDelegate {
+    var methods: [NIOSSHAvailableUserAuthenticationMethods] = []
+
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        self.methods.append(availableMethods)
+        nextChallengePromise.succeed(
+            .init(username: "foo", serviceName: "ssh-connection", offer: .password(.init(password: "bar")))
+        )
+    }
+}
+
+private final class PartialSuccessRecordingDelegate: NIOSSHClientUserAuthenticationDelegate {
+    var methods: [NIOSSHAvailableUserAuthenticationMethods] = []
+    var partialSuccess: [Bool] = []
+    var legacyCalls = 0
+
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        self.legacyCalls += 1
+        XCTFail("The partial-success overload must be dispatched through the protocol requirement")
+        nextChallengePromise.succeed(nil)
+    }
+
+    func nextAuthenticationType(
+        availableMethods: NIOSSHAvailableUserAuthenticationMethods,
+        partialSuccess: Bool,
+        nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
+    ) {
+        self.methods.append(availableMethods)
+        self.partialSuccess.append(partialSuccess)
+        nextChallengePromise.succeed(
+            .init(username: "foo", serviceName: "ssh-connection", offer: .password(.init(password: "bar")))
         )
     }
 }
